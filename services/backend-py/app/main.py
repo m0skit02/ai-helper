@@ -2,9 +2,10 @@ from fastapi import FastAPI, HTTPException
 
 from .schemas import ActionConfirmRequest, ActionConfirmResponse, TaskCreateRequest, TaskResponse
 from .store import TaskStore
+from .tools_client import ToolsClient
 
 app = FastAPI(title="ai-helper-backend")
-store = TaskStore()
+store = TaskStore(tools_client=ToolsClient())
 
 
 @app.get("/health")
