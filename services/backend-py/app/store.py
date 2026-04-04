@@ -75,6 +75,28 @@ class TaskStore:
             self._append_trace(trace, f"{tool}_failed", "fallback", tool)
             return None
 
+    def _set_assistant_message_for_task(
+        self,
+        conversation_id: str | None,
+        task_id: str,
+        content: str,
+    ) -> None:
+        if conversation_id is None:
+            return
+        messages = self._messages.get(conversation_id)
+        if not messages:
+            return
+        now = datetime.now(timezone.utc)
+        for message in reversed(messages):
+            if message.role == "assistant" and message.task_id == task_id:
+                message.content = content
+                message.created_at = now
+                break
+        conv = self._conversations.get(conversation_id)
+        if conv is not None:
+            conv.updated_at = now
+            self._conversations[conversation_id] = conv
+
     def create_task(self, req: TaskCreateRequest, conversation_id: str | None = None) -> TaskResponse:
         task_id = str(uuid4())
         trace_id = str(uuid4())
@@ -200,6 +222,7 @@ class TaskStore:
             trace_id=trace_id,
             status=status,
             conversation_id=conversation_id,
+            session_id=session_id,
             result=result,
             trace=trace,
             error=None,
@@ -240,6 +263,11 @@ class TaskStore:
                 if isinstance(send_resp, dict) and send_resp.get("ok", True):
                     action.status = "sent"
                     task.status = "running"
+                    self._set_assistant_message_for_task(
+                        task.conversation_id,
+                        task.task_id,
+                        "Действие выполнено: сообщение отправлено.",
+                    )
                     self._append_trace(
                         task.trace,
                         "action_confirmed",
@@ -250,6 +278,11 @@ class TaskStore:
                     action.status = "failed"
                     task.status = "failed"
                     task.error = "Message send failed"
+                    self._set_assistant_message_for_task(
+                        task.conversation_id,
+                        task.task_id,
+                        "Не удалось отправить сообщение. Повторите позже.",
+                    )
                     self._append_trace(
                         task.trace,
                         "action_confirmed",
@@ -260,6 +293,11 @@ class TaskStore:
                 action.status = "cancelled"
                 task.status = "failed"
                 task.error = "Action rejected by user"
+                self._set_assistant_message_for_task(
+                    task.conversation_id,
+                    task.task_id,
+                    "Действие отменено пользователем.",
+                )
                 self._append_trace(task.trace, "action_rejected", "cancelled")
 
             return action

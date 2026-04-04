@@ -43,6 +43,7 @@ class TaskResponse(BaseModel):
     trace_id: str
     status: TaskStatus
     conversation_id: str | None = None
+    session_id: str | None = None
     result: TaskResult | None = None
     trace: list[TraceItem] = Field(default_factory=list)
     error: str | None = None
