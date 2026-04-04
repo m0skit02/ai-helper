@@ -1,10 +1,14 @@
-const AI_HELPER_BACKGROUND_MESSAGE = "AI_HELPER_BACKGROUND_REQUEST";
+const MESSAGE_TYPES = {
+    popupRun: "AI_HELPER_POPUP_RUN",
+    popupGetBridgeState: "AI_HELPER_POPUP_GET_BRIDGE_STATE",
+};
 
 const commandInput = document.getElementById("commandInput");
 const sendBtn = document.getElementById("sendBtn");
 const diagnoseBtn = document.getElementById("diagnoseBtn");
 const vkDebugBtn = document.getElementById("vkDebugBtn");
 const statusBox = document.getElementById("statusBox");
+const bridgeState = document.getElementById("bridgeState");
 const exampleButtons = document.querySelectorAll(".exampleBtn");
 
 const examplePayloads = {
@@ -72,7 +76,7 @@ async function runEnvelope() {
 
     try {
         const response = await chrome.runtime.sendMessage({
-            type: AI_HELPER_BACKGROUND_MESSAGE,
+            type: MESSAGE_TYPES.popupRun,
             payload: envelope,
         });
 
@@ -104,7 +108,7 @@ async function runDiagnostics() {
 
     try {
         const response = await chrome.runtime.sendMessage({
-            type: AI_HELPER_BACKGROUND_MESSAGE,
+            type: MESSAGE_TYPES.popupRun,
             payload: {
                 trace_id: crypto.randomUUID(),
                 session_id: null,
@@ -124,7 +128,7 @@ async function runVkDebug() {
 
     try {
         const response = await chrome.runtime.sendMessage({
-            type: AI_HELPER_BACKGROUND_MESSAGE,
+            type: MESSAGE_TYPES.popupRun,
             payload: {
                 trace_id: crypto.randomUUID(),
                 session_id: null,
@@ -150,9 +154,29 @@ function loadExample(exampleName) {
     commandInput.focus();
 }
 
+async function refreshBridgeState() {
+    try {
+        const response = await chrome.runtime.sendMessage({
+            type: MESSAGE_TYPES.popupGetBridgeState,
+        });
+
+        if (!response?.ok) {
+            bridgeState.textContent = "bridge unavailable";
+            return;
+        }
+
+        const mode = response.config?.mode || "manual";
+        const backendUrl = response.config?.backendUrl || "";
+        bridgeState.textContent = backendUrl ? `${mode}: ${backendUrl}` : `${mode} mode`;
+    } catch (_error) {
+        bridgeState.textContent = "bridge unavailable";
+    }
+}
+
 sendBtn.addEventListener("click", runEnvelope);
 diagnoseBtn.addEventListener("click", runDiagnostics);
 vkDebugBtn.addEventListener("click", runVkDebug);
+void refreshBridgeState();
 
 commandInput.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {

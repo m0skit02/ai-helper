@@ -1,36 +1,94 @@
-const AI_HELPER_BACKGROUND_MESSAGE = "AI_HELPER_BACKGROUND_REQUEST";
-const AI_HELPER_CONTENT_MESSAGE = "AI_HELPER_CONTENT_REQUEST";
+const MESSAGE_TYPES = {
+    popupRun: "AI_HELPER_POPUP_RUN",
+    popupGetBridgeState: "AI_HELPER_POPUP_GET_BRIDGE_STATE",
+    popupSaveBridgeConfig: "AI_HELPER_POPUP_SAVE_BRIDGE_CONFIG",
+    contentRequest: "AI_HELPER_CONTENT_REQUEST",
+};
+
+const STORAGE_KEYS = {
+    bridgeConfig: "ai_helper_bridge_config",
+};
+
+const DEFAULT_BRIDGE_CONFIG = {
+    mode: "manual",
+    backendUrl: "",
+    apiKey: "",
+    forwardResponsesToBackend: false,
+};
 
 const draftActions = new Map();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message?.type !== AI_HELPER_BACKGROUND_MESSAGE) {
-        return false;
+    switch (message?.type) {
+        case MESSAGE_TYPES.popupRun:
+            handlePopupRun(message.payload, sender)
+                .then(sendResponse)
+                .catch((error) => {
+                    sendResponse(buildErrorEnvelope(message.payload, "INTERNAL", error.message, true, 0));
+                });
+            return true;
+        case MESSAGE_TYPES.popupGetBridgeState:
+            getBridgeState()
+                .then(sendResponse)
+                .catch((error) => {
+                    sendResponse({
+                        ok: false,
+                        error: error.message,
+                    });
+                });
+            return true;
+        case MESSAGE_TYPES.popupSaveBridgeConfig:
+            saveBridgeConfig(message.payload)
+                .then(sendResponse)
+                .catch((error) => {
+                    sendResponse({
+                        ok: false,
+                        error: error.message,
+                    });
+                });
+            return true;
+        default:
+            return false;
     }
-
-    handleBackgroundRequest(message.payload, sender)
-        .then(sendResponse)
-        .catch((error) => {
-            sendResponse(buildErrorEnvelope(message.payload, "INTERNAL", error.message, true, 0));
-        });
-
-    return true;
 });
 
-async function handleBackgroundRequest(envelope, sender) {
+async function handlePopupRun(envelope, sender) {
+    return dispatchEnvelope(envelope, {
+        source: "popup",
+        sender,
+    });
+}
+
+async function dispatchEnvelope(envelope, context = {}) {
     const startedAt = Date.now();
+    const bridgeConfig = await loadBridgeConfig();
 
     if (!isObject(envelope)) {
         return buildErrorEnvelope({}, "INTERNAL", "Некорректный envelope.", false, 0);
     }
 
-    if (envelope.tool === "browser.message.send") {
-        const response = await handleMessageSend(envelope, sender);
-        response.duration_ms = Date.now() - startedAt;
-        return response;
+    if (bridgeConfig.mode === "backend") {
+        // Placeholder for future backend transport.
+        // The execution contract already goes through this dispatcher, so
+        // swapping transports later will not affect popup/content logic.
     }
 
-    const tab = await resolveActiveTab(sender);
+    const response = await executeEnvelopeLocally(envelope, context);
+    response.duration_ms = Date.now() - startedAt;
+
+    if (bridgeConfig.forwardResponsesToBackend && bridgeConfig.backendUrl) {
+        void forwardResponseToBackend(bridgeConfig, response);
+    }
+
+    return response;
+}
+
+async function executeEnvelopeLocally(envelope, context = {}) {
+    if (envelope.tool === "browser.message.send") {
+        return handleMessageSend(envelope);
+    }
+
+    const tab = await resolveActiveTab(context.sender);
     if (!tab?.id) {
         return buildErrorEnvelope(envelope, "NAVIGATION_FAILED", "Не удалось определить активную вкладку.", true, 0);
     }
@@ -48,7 +106,7 @@ async function handleBackgroundRequest(envelope, sender) {
     await ensureContentScript(tab.id);
 
     const response = await chrome.tabs.sendMessage(tab.id, {
-        type: AI_HELPER_CONTENT_MESSAGE,
+        type: MESSAGE_TYPES.contentRequest,
         payload: envelope,
     });
 
@@ -60,11 +118,10 @@ async function handleBackgroundRequest(envelope, sender) {
         });
     }
 
-    response.duration_ms = Date.now() - startedAt;
     return response;
 }
 
-async function handleMessageSend(envelope, sender) {
+async function handleMessageSend(envelope) {
     const actionId = envelope?.input?.action_id;
     if (!actionId) {
         return buildErrorEnvelope(envelope, "INTERNAL", "Не передан action_id.", false, 0);
@@ -88,7 +145,7 @@ async function handleMessageSend(envelope, sender) {
     await ensureContentScript(action.tabId);
 
     const response = await chrome.tabs.sendMessage(action.tabId, {
-        type: AI_HELPER_CONTENT_MESSAGE,
+        type: MESSAGE_TYPES.contentRequest,
         payload: {
             ...envelope,
             input: {
@@ -121,7 +178,7 @@ async function resolveActiveTab(sender) {
 async function ensureContentScript(tabId) {
     try {
         await chrome.tabs.sendMessage(tabId, {
-            type: AI_HELPER_CONTENT_MESSAGE,
+            type: MESSAGE_TYPES.contentRequest,
             payload: { tool: "browser.ping", input: {} },
         });
     } catch (error) {
@@ -134,6 +191,71 @@ async function ensureContentScript(tabId) {
             files: ["contentScript.js"],
         });
     }
+}
+
+async function getBridgeState() {
+    const bridgeConfig = await loadBridgeConfig();
+    return {
+        ok: true,
+        config: bridgeConfig,
+        draft_actions_count: draftActions.size,
+    };
+}
+
+async function loadBridgeConfig() {
+    const stored = await chrome.storage.local.get(STORAGE_KEYS.bridgeConfig);
+    return {
+        ...DEFAULT_BRIDGE_CONFIG,
+        ...(stored?.[STORAGE_KEYS.bridgeConfig] || {}),
+    };
+}
+
+async function saveBridgeConfig(configPatch) {
+    if (!isObject(configPatch)) {
+        return {
+            ok: false,
+            error: "Некорректный bridge config.",
+        };
+    }
+
+    const current = await loadBridgeConfig();
+    const nextConfig = {
+        ...current,
+        ...configPatch,
+    };
+
+    await chrome.storage.local.set({
+        [STORAGE_KEYS.bridgeConfig]: nextConfig,
+    });
+
+    return {
+        ok: true,
+        config: nextConfig,
+    };
+}
+
+async function forwardResponseToBackend(bridgeConfig, response) {
+    try {
+        await fetch(bridgeConfig.backendUrl, {
+            method: "POST",
+            headers: buildBackendHeaders(bridgeConfig),
+            body: JSON.stringify(response),
+        });
+    } catch (_error) {
+        // Keep manual testing resilient even when backend is unavailable.
+    }
+}
+
+function buildBackendHeaders(bridgeConfig) {
+    const headers = {
+        "Content-Type": "application/json",
+    };
+
+    if (bridgeConfig.apiKey) {
+        headers.Authorization = `Bearer ${bridgeConfig.apiKey}`;
+    }
+
+    return headers;
 }
 
 function buildErrorEnvelope(envelope, code, message, retryable, durationMs) {
