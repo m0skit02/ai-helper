@@ -24,6 +24,27 @@ body {
     padding: 16px;
 }
 
+.bridgePanel {
+    margin: 0 0 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.72);
+}
+
+.bridgeTitle {
+    margin-bottom: 4px;
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.bridgeState {
+    font-size: 12px;
+    word-break: break-word;
+}
+
 h1 {
     margin: 0 0 6px;
     font-size: 20px;
