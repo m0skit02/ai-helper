@@ -266,6 +266,10 @@
   word-break: break-word;
 }
 
+.messageBubble-embedded {
+  margin-top: 12px;
+}
+
 .chatMessages-typing {
   display: flex;
   gap: 6px;
@@ -308,6 +312,11 @@
   padding: 14px 16px;
   background: var(--social-bg);
   max-width: min(100%, 720px);
+}
+
+.taskCard-embedded {
+  max-width: 100%;
+  margin: 0;
 }
 
 .taskCard-loading {

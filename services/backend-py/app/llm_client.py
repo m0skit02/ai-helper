@@ -91,6 +91,98 @@ class LLMClient:
 
         raise LLMClientError("invalid_response", "message content is missing")
 
+    def _is_ollama_native(self) -> bool:
+        return self.url.rstrip("/").endswith("/api/chat")
+
+    def _build_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key and self.api_key != "ollama":
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _build_payload(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"{system_prompt}\n"
+                    "Output only valid JSON. Do not wrap it in markdown. Do not add extra text."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ]
+
+        if self._is_ollama_native():
+            return {
+                "model": self.model,
+                "stream": False,
+                "format": "json",
+                "messages": messages,
+                "options": {"temperature": 0},
+            }
+
+        return {
+            "model": self.model,
+            "temperature": 0,
+            "messages": messages,
+        }
+
+    def _extract_response_text(self, data: dict[str, Any]) -> str:
+        if self._is_ollama_native():
+            message = data.get("message", {})
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            raise LLMClientError("invalid_response", "ollama message content is missing")
+
+        return self._extract_text_content(data)
+
+    def _chat_text(self, system_prompt: str, user_prompt: str) -> str:
+        if not self.enabled():
+            raise LLMClientError("auth", "OPENAI_API_KEY is not set")
+
+        if self._is_ollama_native():
+            payload = {
+                "model": self.model,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "options": {"temperature": 0.2},
+            }
+        else:
+            payload = {
+                "model": self.model,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
+
+        req = request.Request(
+            self.url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=self._build_headers(),
+            method="POST",
+        )
+
+        try:
+            with request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8")
+        except error.HTTPError as exc:
+            raise self._classify_http_error(exc) from exc
+        except (error.URLError, TimeoutError, socket.timeout) as exc:
+            raise self._classify_network_error(exc) from exc
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise LLMClientError("invalid_response", "openai returned invalid json") from exc
+
+        return self._extract_response_text(data)
+
     def _parse_json_content(self, raw_text: str) -> dict[str, Any]:
         cleaned = raw_text.strip()
         if cleaned.startswith("```"):
@@ -110,27 +202,11 @@ class LLMClient:
         if not self.enabled():
             raise LLMClientError("auth", "OPENAI_API_KEY is not set")
 
-        payload = {
-            "model": self.model,
-            "temperature": 0,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        f"{system_prompt}\n"
-                        "Output only valid JSON. Do not wrap it in markdown. Do not add extra text."
-                    ),
-                },
-                {"role": "user", "content": user_prompt},
-            ],
-        }
+        payload = self._build_payload(system_prompt, user_prompt)
         req = request.Request(
             self.url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            headers=self._build_headers(),
             method="POST",
         )
 
@@ -147,7 +223,7 @@ class LLMClient:
         except json.JSONDecodeError as exc:
             raise LLMClientError("invalid_response", "openai returned invalid json") from exc
 
-        raw_text = self._extract_text_content(data)
+        raw_text = self._extract_response_text(data)
         return self._parse_json_content(raw_text)
 
     def plan_query(self, query: str) -> dict[str, Any]:
@@ -175,6 +251,18 @@ class LLMClient:
         if isinstance(summary, str) and summary.strip():
             return summary.strip()
         raise LLMClientError("invalid_response", "missing summary")
+
+    def answer_query(self, query: str) -> str:
+        system_prompt = (
+            "Ты полезный русскоязычный ассистент. "
+            "Отвечай по существу, без воды. "
+            "Если вопрос требует специальных источников, прямо говори об ограничениях. "
+            "Не упоминай внутренние статусы, fallback или технические коды."
+        )
+        answer = self._chat_text(system_prompt, query)
+        if answer.strip():
+            return answer.strip()
+        raise LLMClientError("invalid_response", "empty answer")
 
     def healthcheck(self) -> dict[str, Any]:
         if not self.enabled():

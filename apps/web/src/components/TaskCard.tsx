@@ -5,6 +5,7 @@ import { TracePanel } from "./TracePanel";
 
 type Props = {
   task: TaskResponse;
+  embedded?: boolean;
   onAfterConfirm?: () => void | Promise<void>;
   onError?: (message: string) => void;
 };
@@ -17,6 +18,7 @@ function str(v: unknown): string | undefined {
 
 export function TaskCard({
   task,
+  embedded = false,
   onAfterConfirm,
   onError,
 }: Props) {
@@ -51,7 +53,7 @@ export function TaskCard({
   const buttonsLocked = confirming;
 
   return (
-    <div className="taskCard">
+    <div className={`taskCard${embedded ? " taskCard-embedded" : ""}`}>
       <div className="taskCard-header">
         <span className={`taskStatus taskStatus-${task.status}`}>{task.status}</span>
         {task.error ? (

@@ -106,6 +106,32 @@ export default function ChatPage() {
     loadMessages(selectedId);
   }, [selectedId, loadMessages]);
 
+  const mergeTask = useCallback((taskId: string, task: TaskResponse) => {
+    let shouldRefreshMessages = false;
+
+    setTasksById((prev) => {
+      const previous = prev[taskId];
+      const wasRunning = previous?.status === "running";
+      const isTerminal = task.status !== "running";
+      const assistantMessage = messages.find(
+        (item) => item.role === "assistant" && item.task_id === taskId,
+      );
+      const hasPlaceholderText =
+        assistantMessage?.content.trim() === "Задача принята в обработку.";
+
+      shouldRefreshMessages =
+        Boolean(selectedId) &&
+        isTerminal &&
+        (wasRunning || hasPlaceholderText);
+      return { ...prev, [taskId]: task };
+    });
+
+    if (shouldRefreshMessages && selectedId) {
+      void loadMessages(selectedId);
+      void refreshConversations();
+    }
+  }, [loadMessages, messages, refreshConversations, selectedId]);
+
   useEffect(() => {
     if (!selectedId || messages.length === 0) return;
     let cancelled = false;
@@ -120,7 +146,7 @@ export default function ChatPage() {
       getTask(taskId)
         .then((t) => {
           if (!cancelled) {
-            setTasksById((prev) => ({ ...prev, [taskId]: t }));
+            mergeTask(taskId, t);
           }
         })
         .catch(() => {
@@ -130,11 +156,7 @@ export default function ChatPage() {
     return () => {
       cancelled = true;
     };
-  }, [messages, selectedId]);
-
-  const mergeTask = useCallback((taskId: string, task: TaskResponse) => {
-    setTasksById((prev) => ({ ...prev, [taskId]: task }));
-  }, []);
+  }, [mergeTask, messages, selectedId]);
 
   usePollActiveTasks(selectedId, tasksById, mergeTask);
 
@@ -205,7 +227,7 @@ export default function ChatPage() {
         taskIds.map(async (id) => {
           try {
             const t = await getTask(id);
-            setTasksById((prev) => ({ ...prev, [id]: t }));
+            mergeTask(id, t);
           } catch {
             /* ignore */
           }

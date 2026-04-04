@@ -33,24 +33,35 @@ export function ChatMessages({
       ) : null}
 
       <ul className="chatMessages-list">
-        {messages.map((m) => (
-          <li key={m.message_id} className="chatMessages-row">
-            <MessageBubble message={m} />
-            {m.role === "assistant" && m.task_id ? (
-              <div className="chatMessages-task">
-                {tasksById[m.task_id] ? (
-                  <TaskCard
-                    task={tasksById[m.task_id]!}
-                    onAfterConfirm={onAfterConfirm}
-                    onError={onTaskError}
-                  />
-                ) : (
-                  <div className="taskCard taskCard-loading">Загрузка задачи…</div>
-                )}
-              </div>
-            ) : null}
-          </li>
-        ))}
+        {messages.map((m) => {
+          const task = m.task_id ? tasksById[m.task_id] : undefined;
+
+          return (
+            <li key={m.message_id} className="chatMessages-row">
+              {m.role === "assistant" && m.task_id ? (
+                <div className="messageBubble messageBubble-assistant">
+                  <p className="messageBubble-text">{m.content}</p>
+                  <div className="messageBubble-embedded">
+                    {task ? (
+                      <TaskCard
+                        task={task}
+                        embedded
+                        onAfterConfirm={onAfterConfirm}
+                        onError={onTaskError}
+                      />
+                    ) : (
+                      <div className="taskCard taskCard-embedded taskCard-loading">
+                        Загрузка задачи…
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <MessageBubble message={m} />
+              )}
+            </li>
+          );
+        })}
       </ul>
 
       {sending ? (

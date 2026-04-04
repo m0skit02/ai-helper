@@ -20,10 +20,8 @@ services:
         condition: service_healthy
     environment:
       OLLAMA_HOST: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
-    entrypoint: ["/bin/sh", "-c"]
-    command: >
-      ollama pull "$${OLLAMA_MODEL}"
+    entrypoint: ["ollama"]
+    command: ["pull", "${OLLAMA_MODEL:-qwen2.5:7b}"]
     restart: "no"
 
   backend:
@@ -41,7 +39,7 @@ services:
     environment:
       TOOLS_CALL_URL: http://tools-go:8080/mcp/tool/call
       OPENAI_API_KEY: ollama
-      OPENAI_URL: http://ollama:11434/v1/chat/completions
+      OPENAI_URL: http://ollama:11434/api/chat
       OPENAI_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
       OPENAI_TIMEOUT_SECONDS: ${OPENAI_TIMEOUT_SECONDS:-180}
     ports:

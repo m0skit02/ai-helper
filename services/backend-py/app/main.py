@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 from .schemas import (
     ActionConfirmRequest,
@@ -90,10 +90,16 @@ def list_messages(conversation_id: str) -> ConversationMessagesResponse:
     response_model=ConversationMessageCreateResponse,
 )
 def create_message(
+    background_tasks: BackgroundTasks,
     conversation_id: str,
     req: ConversationMessageCreateRequest,
 ) -> ConversationMessageCreateResponse:
     created = store.add_message_and_create_task(conversation_id, req)
     if created is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    background_tasks.add_task(
+        store.process_task,
+        created.task.task_id,
+        TaskCreateRequest(query=req.content, allow_social_actions=req.allow_social_actions),
+    )
     return created

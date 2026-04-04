@@ -493,7 +493,7 @@ func main() {
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/mcp/tool/call", srv.handleCallTool)
 
-	addr := "127.0.0.1:" + port
+	addr := "0.0.0.0:" + port
 	log.Printf("tools-go listening on http://%s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)

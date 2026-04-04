@@ -25,8 +25,42 @@ from .tools_client import ToolsClient, ToolsClientError
 
 def requires_message_action(query: str) -> bool:
     q = query.lower()
-    verbs = ("напиши", "отправь", "send", "message", "сообщение")
-    return any(v in q for v in verbs)
+    patterns = (
+        "напиши",
+        "отправь",
+        "send",
+        "write to",
+        "отправь сообщение",
+        "напиши сообщение",
+    )
+    return any(pattern in q for pattern in patterns)
+
+
+def wants_news_search(query: str) -> bool:
+    q = query.lower()
+    patterns = ("новост", "news", "стат", "публикац", "за неделю", "за день")
+    return any(pattern in q for pattern in patterns)
+
+
+def wants_product_search(query: str) -> bool:
+    q = query.lower()
+    keywords = (
+        "iphone",
+        "samsung",
+        "xiaomi",
+        "товар",
+        "маркетплейс",
+        "купить",
+        "цена",
+        "стоимость",
+        "памят",
+        "гб",
+        "gb",
+        "доставка",
+        "продавец",
+        "новый",
+    )
+    return any(keyword in q for keyword in keywords)
 
 
 class TaskStore:
@@ -41,6 +75,14 @@ class TaskStore:
         self._messages: dict[str, list[MessageItem]] = {}
         self._tools = tools_client
         self._llm = llm_client
+
+    def _empty_result(self) -> TaskResult:
+        return TaskResult(
+            product=None,
+            news=[],
+            sources=[],
+            actions=[],
+        )
 
     def reset_for_tests(
         self,
@@ -277,6 +319,23 @@ class TaskStore:
 
         return " ".join(parts)
 
+    def _answer_general_query(self, query: str, trace: list[TraceItem]) -> str:
+        if self._llm is not None and self._llm.enabled():
+            try:
+                answer = self._llm.answer_query(query)
+                self._append_trace(trace, "llm_answer_ok", "ok", "llm.answer")
+                return answer
+            except LLMClientError as exc:
+                self._append_trace(
+                    trace,
+                    "llm_answer_failed",
+                    "fallback",
+                    "llm.answer",
+                    detail=f"{exc.category}: {exc.message}",
+                )
+
+        return "Не удалось подготовить ответ по этому запросу."
+
     def _decorate_assistant_text(self, summary: str, task: TaskResponse) -> str:
         sections = [summary.strip()]
         links_block = self._format_links_block(task)
@@ -289,11 +348,8 @@ class TaskStore:
 
     def _fallback_plan(self, query: str) -> dict[str, Any]:
         wants_message = requires_message_action(query)
-        q = query.lower()
-        wants_news = any(token in q for token in ("новост", "news", "статья"))
-        wants_product = any(token in q for token in ("купи", "найди", "iphone", "товар", "price", "цена"))
-        if not wants_news and not wants_product and not wants_message:
-            wants_product = True
+        wants_news = wants_news_search(query)
+        wants_product = wants_product_search(query)
         return {
             "wants_product": wants_product,
             "wants_news": wants_news,
@@ -306,31 +362,14 @@ class TaskStore:
 
     def _plan_query(self, query: str, trace: list[TraceItem]) -> dict[str, Any]:
         fallback = self._fallback_plan(query)
-        if self._llm is None or not self._llm.enabled():
-            self._append_trace(trace, "llm_plan_skipped", "no_llm", "llm.plan")
-            return fallback
-        try:
-            raw = self._llm.plan_query(query)
-            plan = {
-                "wants_product": bool(raw.get("wants_product", fallback["wants_product"])),
-                "wants_news": bool(raw.get("wants_news", fallback["wants_news"])),
-                "wants_message": bool(raw.get("wants_message", fallback["wants_message"])),
-                "search_query": str(raw.get("search_query") or fallback["search_query"]),
-                "news_topic": str(raw.get("news_topic") or fallback["news_topic"]),
-                "destination_hint": str(raw.get("destination_hint") or fallback["destination_hint"]),
-                "message_text": str(raw.get("message_text") or fallback["message_text"]),
-            }
-            self._append_trace(trace, "llm_plan_ok", "ok", "llm.plan")
-            return plan
-        except LLMClientError as exc:
-            self._append_trace(
-                trace,
-                "llm_plan_failed",
-                "fallback",
-                "llm.plan",
-                detail=f"{exc.category}: {exc.message}",
-            )
-            return fallback
+        has_supported_work = bool(
+            fallback["wants_product"] or fallback["wants_news"] or fallback["wants_message"]
+        )
+        if has_supported_work:
+            self._append_trace(trace, "rule_plan_ok", "ok", "rule.plan")
+        else:
+            self._append_trace(trace, "rule_plan_general", "ok", "rule.plan")
+        return fallback
 
     def create_task(self, req: TaskCreateRequest, conversation_id: str | None = None) -> TaskResponse:
         task_id = str(uuid4())
@@ -345,27 +384,42 @@ class TaskStore:
             )
         ]
         plan = self._plan_query(req.query, trace)
+        has_supported_work = bool(plan["wants_product"] or plan["wants_news"] or plan["wants_message"])
+        has_search_work = bool(plan["wants_product"] or plan["wants_news"])
 
-        # MVP stub result so frontend can integrate immediately.
-        result = TaskResult(
-            product=None,
-            news=[],
-            sources=[],
-            actions=[],
-        )
+        result = self._empty_result()
 
         status = "running"
+        task_error: str | None = None
+
+        if not has_supported_work:
+            status = "done"
+            task = TaskResponse(
+                task_id=task_id,
+                trace_id=trace_id,
+                status=status,
+                conversation_id=conversation_id,
+                session_id=session_id,
+                result=result,
+                trace=trace,
+                error=None,
+            )
+            with self._lock:
+                self._tasks[task_id] = task
+            return task
 
         # Universal product/news retrieval pipeline.
-        search_resp = self._call_tool(
-            trace=trace,
-            trace_id=trace_id,
-            tool="browser.search",
-            session_id=session_id,
-            input_data={"query": plan["search_query"], "engine": "yandex", "limit": 5},
-        )
-        if search_resp and isinstance(search_resp, dict):
-            session_id = search_resp.get("session_id") or session_id
+        search_resp = None
+        if has_search_work:
+            search_resp = self._call_tool(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.search",
+                session_id=session_id,
+                input_data={"query": plan["search_query"], "engine": "yandex", "limit": 5},
+            )
+            if search_resp and isinstance(search_resp, dict):
+                session_id = search_resp.get("session_id") or session_id
 
         extract_product_resp = None
         if plan["wants_product"]:
@@ -469,8 +523,188 @@ class TaskStore:
             session_id=session_id,
             result=result,
             trace=trace,
+            error=task_error,
+        )
+
+        with self._lock:
+            self._tasks[task_id] = task
+        return task
+
+    def create_task_shell(self, req: TaskCreateRequest, conversation_id: str | None = None) -> TaskResponse:
+        task = TaskResponse(
+            task_id=str(uuid4()),
+            trace_id=str(uuid4()),
+            status="running",
+            conversation_id=conversation_id,
+            session_id=None,
+            result=self._empty_result(),
+            trace=[
+                TraceItem(
+                    step="task_created",
+                    status="ok",
+                    ts=datetime.now(timezone.utc),
+                )
+            ],
             error=None,
         )
+        with self._lock:
+            self._tasks[task.task_id] = task
+        return task
+
+    def process_task(self, task_id: str, req: TaskCreateRequest) -> TaskResponse | None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+        if task is None:
+            return None
+
+        task = task.model_copy(deep=True)
+        trace = task.trace
+        trace_id = task.trace_id
+        session_id = task.session_id
+        conversation_id = task.conversation_id
+        plan = self._plan_query(req.query, trace)
+        has_supported_work = bool(plan["wants_product"] or plan["wants_news"] or plan["wants_message"])
+        has_search_work = bool(plan["wants_product"] or plan["wants_news"])
+        result = self._empty_result()
+        task_error: str | None = None
+        status = "running"
+
+        if not has_supported_work:
+            assistant_text = self._answer_general_query(req.query, trace)
+            task.status = "done"
+            task.result = result
+            task.error = None
+            task.trace = trace
+            if conversation_id is not None:
+                self._set_assistant_message_for_task(
+                    conversation_id,
+                    task.task_id,
+                    assistant_text,
+                )
+            with self._lock:
+                self._tasks[task_id] = task
+            return task
+
+        search_resp = None
+        if has_search_work:
+            search_resp = self._call_tool(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.search",
+                session_id=session_id,
+                input_data={"query": plan["search_query"], "engine": "yandex", "limit": 5},
+            )
+            if search_resp and isinstance(search_resp, dict):
+                session_id = search_resp.get("session_id") or session_id
+
+        extract_product_resp = None
+        if plan["wants_product"]:
+            extract_product_resp = self._call_tool(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.extract",
+                session_id=session_id,
+                input_data={
+                    "schema": {
+                        "type": "product",
+                        "fields": ["title", "price", "currency", "url"],
+                    },
+                    "mode": "dom_first",
+                    "limit": 5,
+                },
+            )
+        product_items = (
+            extract_product_resp.get("output", {}).get("items", [])
+            if isinstance(extract_product_resp, dict)
+            else []
+        )
+        if isinstance(product_items, list) and product_items:
+            first = product_items[0] if isinstance(product_items[0], dict) else {}
+            result.product = self._normalize_product(first)
+
+        extract_news_resp = None
+        if plan["wants_news"]:
+            extract_news_resp = self._call_tool(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.extract",
+                session_id=session_id,
+                input_data={
+                    "schema": {
+                        "type": "news",
+                        "fields": ["title", "summary", "published_at", "url", "source"],
+                    },
+                    "mode": "dom_first",
+                    "limit": 5,
+                },
+            )
+        news_items = (
+            extract_news_resp.get("output", {}).get("items", [])
+            if isinstance(extract_news_resp, dict)
+            else []
+        )
+        result.news = self._normalize_news(news_items)
+
+        search_sources: list[str] = []
+        if isinstance(search_resp, dict):
+            results = search_resp.get("output", {}).get("results", [])
+            search_sources = self._normalize_sources(results)
+
+        news_sources = [item.url for item in result.news if item.url.strip()]
+        product_sources = [result.product.url] if self._has_product_data(result.product) and result.product is not None else []
+        result.sources = self._merge_sources(product_sources, news_sources, search_sources)
+
+        if req.allow_social_actions and bool(plan["wants_message"]):
+            draft_resp = self._call_tool(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.message.draft",
+                session_id=session_id,
+                input_data={
+                    "destination_hint": plan["destination_hint"],
+                    "message_text": plan["message_text"],
+                },
+            )
+
+            if isinstance(draft_resp, dict):
+                draft_output = draft_resp.get("output", {})
+                action_id = draft_output.get("action_id", str(uuid4()))
+                payload = draft_output if isinstance(draft_output, dict) else {}
+                if draft_resp.get("session_id") is not None:
+                    payload["session_id"] = draft_resp.get("session_id")
+            else:
+                action_id = str(uuid4())
+                payload = {
+                    "destination_hint": plan["destination_hint"],
+                    "message_text": plan["message_text"],
+                }
+
+            result.actions.append(
+                ActionItem(
+                    action_id=action_id,
+                    type="message_send",
+                    status="waiting_confirm",
+                    payload=payload,
+                )
+            )
+            status = "needs_confirmation"
+        else:
+            status = "done"
+
+        task.status = status
+        task.session_id = session_id
+        task.result = result
+        task.trace = trace
+        task.error = task_error
+        assistant_text: str | None = None
+
+        if conversation_id is not None:
+            assistant_text = self._build_assistant_text(req.query, task)
+            self._set_assistant_message_for_task(
+                conversation_id,
+                task.task_id,
+                assistant_text,
+            )
 
         with self._lock:
             self._tasks[task_id] = task
@@ -478,7 +712,8 @@ class TaskStore:
 
     def get_task(self, task_id: str) -> TaskResponse | None:
         with self._lock:
-            return self._tasks.get(task_id)
+            task = self._tasks.get(task_id)
+            return task.model_copy(deep=True) if task is not None else None
 
     def confirm_action(self, req: ActionConfirmRequest) -> ActionItem | None:
         with self._lock:
@@ -563,11 +798,12 @@ class TaskStore:
 
     def get_conversation(self, conversation_id: str) -> ConversationResponse | None:
         with self._lock:
-            return self._conversations.get(conversation_id)
+            conv = self._conversations.get(conversation_id)
+            return conv.model_copy(deep=True) if conv is not None else None
 
     def list_conversations(self) -> list[ConversationResponse]:
         with self._lock:
-            values = list(self._conversations.values())
+            values = [item.model_copy(deep=True) for item in self._conversations.values()]
         return sorted(values, key=lambda x: x.updated_at, reverse=True)
 
     def list_messages(self, conversation_id: str) -> list[MessageItem] | None:
@@ -575,7 +811,7 @@ class TaskStore:
             items = self._messages.get(conversation_id)
             if items is None:
                 return None
-            return list(items)
+            return [item.model_copy(deep=True) for item in items]
 
     def _build_assistant_text(self, query: str, task: TaskResponse) -> str:
         if self._llm is not None and self._llm.enabled():
@@ -612,7 +848,7 @@ class TaskStore:
         with self._lock:
             self._messages[conversation_id].append(user_message)
 
-        task = self.create_task(
+        task = self.create_task_shell(
             TaskCreateRequest(query=req.content, allow_social_actions=req.allow_social_actions),
             conversation_id=conversation_id,
         )
@@ -621,7 +857,7 @@ class TaskStore:
             message_id=str(uuid4()),
             conversation_id=conversation_id,
             role="assistant",
-            content=self._build_assistant_text(req.content, task),
+            content="Задача принята в обработку.",
             created_at=datetime.now(timezone.utc),
             task_id=task.task_id,
         )
