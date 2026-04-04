@@ -1,2 +1,38 @@
-<button id="sendTest">Отправить тестовую команду</button>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <title>AI Helper Tools Tester</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="container">
+    <h1>AI Helper Tools MVP</h1>
+    <p class="subtitle">Вставь JSON-envelope и проверь выполнение инструмента на текущем сайте.</p>
+
+    <textarea
+        id="commandInput"
+        rows="16"
+        placeholder='{"trace_id":"uuid","session_id":null,"tool":"browser.search","input":{"query":"Найди iPhone 256GB новый","engine":"yandex","limit":5}}'
+    ></textarea>
+
+    <div class="actions">
+        <button id="sendBtn">Выполнить tool</button>
+        <button id="diagnoseBtn" class="secondaryBtn">Диагностика страницы</button>
+        <button id="vkDebugBtn" class="secondaryBtn">VK debug results</button>
+    </div>
+
+    <div class="examples">
+        <div class="examples-title">Примеры envelope</div>
+        <button class="exampleBtn" data-example="search">browser.search</button>
+        <button class="exampleBtn" data-example="extract">browser.extract</button>
+        <button class="exampleBtn" data-example="draft">browser.message.draft</button>
+        <button class="exampleBtn" data-example="send">browser.message.send</button>
+    </div>
+
+    <pre id="statusBox" class="statusBox">Ожидаю envelope...</pre>
+</div>
+
 <script src="popup.js"></script>
+</body>
+</html>

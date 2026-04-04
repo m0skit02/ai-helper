@@ -1,8 +1,115 @@
+:root {
+    color-scheme: light;
+    --bg: #f4efe7;
+    --panel: #fffaf2;
+    --text: #1f2937;
+    --muted: #6b7280;
+    --accent: #c2410c;
+    --accent-strong: #9a3412;
+    --border: #e7dcc8;
+    --success: #166534;
+    --error: #b91c1c;
+    --pending: #92400e;
+}
+
+body {
+    margin: 0;
+    width: 360px;
+    background: radial-gradient(circle at top, #fff7ed 0%, var(--bg) 62%);
+    color: var(--text);
+    font: 14px/1.4 "Segoe UI", sans-serif;
+}
+
+.container {
+    padding: 16px;
+}
+
+h1 {
+    margin: 0 0 6px;
+    font-size: 20px;
+}
+
+.subtitle {
+    margin: 0 0 12px;
+    color: var(--muted);
+}
+
+textarea {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    min-height: 110px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--text);
+}
+
 button {
-    padding: 8px 12px;
-    border-radius: 8px;
-    background-color: #3b82f6;
-    color: white;
+    width: 100%;
+    padding: 10px 12px;
     border: none;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+    color: white;
     cursor: pointer;
+    font-weight: 600;
+}
+
+.actions {
+    display: grid;
+    gap: 8px;
+}
+
+.examples {
+    margin-top: 12px;
+}
+
+.examples-title {
+    margin-bottom: 8px;
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.exampleBtn {
+    margin-bottom: 8px;
+    background: #ffffff;
+    color: var(--text);
+    border: 1px solid var(--border);
+}
+
+.secondaryBtn {
+    background: #ffffff;
+    color: var(--text);
+    border: 1px solid var(--border);
+}
+
+.statusBox {
+    margin: 12px 0 0;
+    padding: 12px;
+    min-height: 120px;
+    overflow: auto;
+    white-space: pre-wrap;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.75);
+    font-size: 12px;
+}
+
+.statusBox[data-type="success"] {
+    border-color: rgba(22, 101, 52, 0.25);
+    color: var(--success);
+}
+
+.statusBox[data-type="error"] {
+    border-color: rgba(185, 28, 28, 0.25);
+    color: var(--error);
+}
+
+.statusBox[data-type="pending"] {
+    border-color: rgba(146, 64, 14, 0.25);
+    color: var(--pending);
 }
