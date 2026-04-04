@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError,
   createConversation,
@@ -34,6 +34,7 @@ export default function ChatPage() {
   const [healthOk, setHealthOk] = useState<boolean | null>(null);
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const loadingTaskIdsRef = useRef<Set<string>>(new Set());
 
   const showError = useCallback((text: string) => {
     setToast({ kind: "error", text });
@@ -79,7 +80,6 @@ export default function ChatPage() {
   const loadMessages = useCallback(
     async (conversationId: string) => {
       setMessagesLoading(true);
-      setTasksById({});
       try {
         const { items } = await listMessages(conversationId);
         setMessages(items);
@@ -101,48 +101,54 @@ export default function ChatPage() {
     if (!selectedId) {
       setMessages([]);
       setTasksById({});
+      loadingTaskIdsRef.current.clear();
       return;
     }
+    setTasksById({});
+    loadingTaskIdsRef.current.clear();
     loadMessages(selectedId);
   }, [selectedId, loadMessages]);
 
   const mergeTask = useCallback((taskId: string, task: TaskResponse) => {
-    let shouldRefreshMessages = false;
+    const previous = tasksById[taskId];
+    const wasRunning = previous?.status === "running";
+    const isTerminal = task.status !== "running";
+    const assistantMessage = messages.find(
+      (item) => item.role === "assistant" && item.task_id === taskId,
+    );
+    const hasPlaceholderText =
+      assistantMessage?.content.trim() === "Задача принята в обработку.";
+    const shouldRefreshMessages =
+      Boolean(selectedId) &&
+      isTerminal &&
+      (wasRunning || hasPlaceholderText);
 
-    setTasksById((prev) => {
-      const previous = prev[taskId];
-      const wasRunning = previous?.status === "running";
-      const isTerminal = task.status !== "running";
-      const assistantMessage = messages.find(
-        (item) => item.role === "assistant" && item.task_id === taskId,
-      );
-      const hasPlaceholderText =
-        assistantMessage?.content.trim() === "Задача принята в обработку.";
-
-      shouldRefreshMessages =
-        Boolean(selectedId) &&
-        isTerminal &&
-        (wasRunning || hasPlaceholderText);
-      return { ...prev, [taskId]: task };
-    });
+    setTasksById((prev) => ({ ...prev, [taskId]: task }));
 
     if (shouldRefreshMessages && selectedId) {
       void loadMessages(selectedId);
       void refreshConversations();
     }
-  }, [loadMessages, messages, refreshConversations, selectedId]);
+  }, [loadMessages, messages, refreshConversations, selectedId, tasksById]);
 
   useEffect(() => {
     if (!selectedId || messages.length === 0) return;
     let cancelled = false;
-    const taskIds = [
+    const missingTaskIds = [
       ...new Set(
         messages
-          .filter((m) => m.role === "assistant" && m.task_id)
+          .filter(
+            (m) =>
+              m.role === "assistant" &&
+              m.task_id &&
+              !tasksById[m.task_id] &&
+              !loadingTaskIdsRef.current.has(m.task_id),
+          )
           .map((m) => m.task_id as string),
       ),
     ];
-    taskIds.forEach((taskId) => {
+    missingTaskIds.forEach((taskId) => {
+      loadingTaskIdsRef.current.add(taskId);
       getTask(taskId)
         .then((t) => {
           if (!cancelled) {
@@ -151,12 +157,15 @@ export default function ChatPage() {
         })
         .catch(() => {
           /* 404 / network — остаётся placeholder в UI */
+        })
+        .finally(() => {
+          loadingTaskIdsRef.current.delete(taskId);
         });
     });
     return () => {
       cancelled = true;
     };
-  }, [mergeTask, messages, selectedId]);
+  }, [mergeTask, messages, selectedId, tasksById]);
 
   usePollActiveTasks(selectedId, tasksById, mergeTask);
 
