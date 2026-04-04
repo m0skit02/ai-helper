@@ -1,20 +1,71 @@
-version: "3.9"
+name: ai-helper
 
 services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      ollama pull "$${OLLAMA_MODEL}"
+    restart: "no"
+
   backend:
+    image: ${BACKEND_IMAGE:-ai-helper-backend:local}
     build:
       context: ../../services/backend-py
+      network: host
+    depends_on:
+      tools-go:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    environment:
+      TOOLS_CALL_URL: http://tools-go:8080/mcp/tool/call
+      OPENAI_API_KEY: ollama
+      OPENAI_URL: http://ollama:11434/v1/chat/completions
+      OPENAI_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+      OPENAI_TIMEOUT_SECONDS: ${OPENAI_TIMEOUT_SECONDS:-180}
     ports:
       - "8000:8000"
+    restart: unless-stopped
 
   tools-go:
+    image: ${TOOLS_GO_IMAGE:-ai-helper-tools-go:local}
     build:
       context: ../../services/tools-go
     ports:
       - "8080:8080"
+    restart: unless-stopped
 
   web:
+    image: ${WEB_IMAGE:-ai-helper-web:local}
     build:
       context: ../../apps/web
     ports:
-      - "3000:3000"
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  ollama-data:

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"html"
@@ -14,8 +16,6 @@ import (
 	"sync"
 	"time"
 	"unicode"
-
-	"github.com/google/uuid"
 )
 
 type ToolCallRequest struct {
@@ -108,11 +108,19 @@ func newToolServer() *ToolServer {
 	}
 }
 
+func newID(prefix string) string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return prefix + strings.ReplaceAll(time.Now().UTC().Format("20060102150405.000000000"), ".", "")
+	}
+	return prefix + hex.EncodeToString(buf)
+}
+
 func (s *ToolServer) ensureSession(sessionID string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if strings.TrimSpace(sessionID) == "" {
-		sessionID = "sess-" + uuid.NewString()
+		sessionID = newID("sess-")
 	}
 	state, ok := s.sessions[sessionID]
 	if !ok {
@@ -219,7 +227,7 @@ func (s *ToolServer) handleCallTool(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case "browser.message.draft":
-		actionID := "act-" + uuid.NewString()
+		actionID := newID("act-")
 		destinationHint := asString(req.Input["destination_hint"])
 		messageText := asString(req.Input["message_text"])
 		s.mu.Lock()
@@ -267,7 +275,7 @@ func (s *ToolServer) handleCallTool(w http.ResponseWriter, r *http.Request) {
 			resp.Output = map[string]interface{}{
 				"status":      "sent",
 				"action_id":   actionID,
-				"message_ref": "msg-" + uuid.NewString(),
+				"message_ref": newID("msg-"),
 				"recipient":   draft.DestinationHint,
 			}
 		}

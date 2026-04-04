@@ -6,3 +6,4 @@
 **/.venv/
 **/__pycache__/
 *.pyc
+services/tools-go/tools-service
