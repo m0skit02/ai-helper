@@ -5,7 +5,18 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 
-from .schemas import ActionConfirmRequest, ActionItem, TaskCreateRequest, TaskResponse, TaskResult, TraceItem
+from .schemas import (
+    ActionConfirmRequest,
+    ActionItem,
+    ConversationMessageCreateRequest,
+    ConversationMessageCreateResponse,
+    ConversationResponse,
+    MessageItem,
+    TaskCreateRequest,
+    TaskResponse,
+    TaskResult,
+    TraceItem,
+)
 from .tools_client import ToolsClient, ToolsClientError
 
 
@@ -19,6 +30,8 @@ class TaskStore:
     def __init__(self, tools_client: ToolsClient | None = None) -> None:
         self._lock = Lock()
         self._tasks: dict[str, TaskResponse] = {}
+        self._conversations: dict[str, ConversationResponse] = {}
+        self._messages: dict[str, list[MessageItem]] = {}
         self._tools = tools_client
 
     def _append_trace(
@@ -62,7 +75,7 @@ class TaskStore:
             self._append_trace(trace, f"{tool}_failed", "fallback", tool)
             return None
 
-    def create_task(self, req: TaskCreateRequest) -> TaskResponse:
+    def create_task(self, req: TaskCreateRequest, conversation_id: str | None = None) -> TaskResponse:
         task_id = str(uuid4())
         trace_id = str(uuid4())
         session_id: str | None = None
@@ -186,6 +199,7 @@ class TaskStore:
             task_id=task_id,
             trace_id=trace_id,
             status=status,
+            conversation_id=conversation_id,
             result=result,
             trace=trace,
             error=None,
@@ -249,3 +263,99 @@ class TaskStore:
                 self._append_trace(task.trace, "action_rejected", "cancelled")
 
             return action
+
+    def create_conversation(self, title: str | None = None) -> ConversationResponse:
+        now = datetime.now(timezone.utc)
+        conversation_id = str(uuid4())
+        conv = ConversationResponse(
+            conversation_id=conversation_id,
+            title=title or "Новый чат",
+            created_at=now,
+            updated_at=now,
+        )
+        with self._lock:
+            self._conversations[conversation_id] = conv
+            self._messages[conversation_id] = []
+        return conv
+
+    def get_conversation(self, conversation_id: str) -> ConversationResponse | None:
+        with self._lock:
+            return self._conversations.get(conversation_id)
+
+    def list_conversations(self) -> list[ConversationResponse]:
+        with self._lock:
+            values = list(self._conversations.values())
+        return sorted(values, key=lambda x: x.updated_at, reverse=True)
+
+    def list_messages(self, conversation_id: str) -> list[MessageItem] | None:
+        with self._lock:
+            items = self._messages.get(conversation_id)
+            if items is None:
+                return None
+            return list(items)
+
+    def _build_assistant_text(self, task: TaskResponse) -> str:
+        if task.status == "needs_confirmation":
+            return "Требуется подтверждение действия перед отправкой сообщения."
+
+        product_title = ""
+        if task.result and isinstance(task.result.product, dict):
+            product_title = str(task.result.product.get("title", "")).strip()
+
+        news_count = len(task.result.news) if task.result else 0
+        parts: list[str] = []
+        if product_title:
+            parts.append(f"Товар: {product_title}")
+        if news_count:
+            parts.append(f"Новости: {news_count}")
+        if not parts:
+            return "Задача принята в обработку."
+        return ". ".join(parts)
+
+    def add_message_and_create_task(
+        self,
+        conversation_id: str,
+        req: ConversationMessageCreateRequest,
+    ) -> ConversationMessageCreateResponse | None:
+        with self._lock:
+            conv = self._conversations.get(conversation_id)
+            if conv is None:
+                return None
+
+        user_message = MessageItem(
+            message_id=str(uuid4()),
+            conversation_id=conversation_id,
+            role="user",
+            content=req.content,
+            created_at=datetime.now(timezone.utc),
+        )
+        with self._lock:
+            self._messages[conversation_id].append(user_message)
+
+        task = self.create_task(
+            TaskCreateRequest(query=req.content, allow_social_actions=req.allow_social_actions),
+            conversation_id=conversation_id,
+        )
+
+        assistant_message = MessageItem(
+            message_id=str(uuid4()),
+            conversation_id=conversation_id,
+            role="assistant",
+            content=self._build_assistant_text(task),
+            created_at=datetime.now(timezone.utc),
+            task_id=task.task_id,
+        )
+        with self._lock:
+            self._messages[conversation_id].append(assistant_message)
+            conv = self._conversations[conversation_id]
+            if conv.title == "Новый чат":
+                conv.title = req.content[:60]
+            conv.updated_at = datetime.now(timezone.utc)
+            self._conversations[conversation_id] = conv
+
+        return ConversationMessageCreateResponse(
+            conversation_id=conversation_id,
+            user_message=user_message,
+            assistant_message=assistant_message,
+            task=task,
+        )
