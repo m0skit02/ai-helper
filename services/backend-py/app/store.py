@@ -163,6 +163,8 @@ class TaskStore:
                 draft_output = draft_resp.get("output", {})
                 action_id = draft_output.get("action_id", str(uuid4()))
                 payload = draft_output if isinstance(draft_output, dict) else {}
+                if draft_resp.get("session_id") is not None:
+                    payload["session_id"] = draft_resp.get("session_id")
             else:
                 action_id = str(uuid4())
                 payload = {
@@ -208,26 +210,42 @@ class TaskStore:
                 return None
 
             if req.decision == "approve":
-                action.status = "sent"
-                task.status = "running"
-                task.trace.append(
-                    TraceItem(
-                        step="action_confirmed",
-                        status="ok",
-                        ts=datetime.now(timezone.utc),
-                        tool="browser.message.send",
-                    )
+                session_id = None
+                if isinstance(action.payload, dict):
+                    maybe_session = action.payload.get("session_id")
+                    if isinstance(maybe_session, str):
+                        session_id = maybe_session
+
+                send_resp = self._call_tool(
+                    trace=task.trace,
+                    trace_id=task.trace_id,
+                    tool="browser.message.send",
+                    session_id=session_id,
+                    input_data={"action_id": req.action_id, "confirm": True},
                 )
+                if isinstance(send_resp, dict) and send_resp.get("ok", True):
+                    action.status = "sent"
+                    task.status = "running"
+                    self._append_trace(
+                        task.trace,
+                        "action_confirmed",
+                        "ok",
+                        "browser.message.send",
+                    )
+                else:
+                    action.status = "failed"
+                    task.status = "failed"
+                    task.error = "Message send failed"
+                    self._append_trace(
+                        task.trace,
+                        "action_confirmed",
+                        "failed",
+                        "browser.message.send",
+                    )
             else:
                 action.status = "cancelled"
                 task.status = "failed"
                 task.error = "Action rejected by user"
-                task.trace.append(
-                    TraceItem(
-                        step="action_rejected",
-                        status="cancelled",
-                        ts=datetime.now(timezone.utc),
-                    )
-                )
+                self._append_trace(task.trace, "action_rejected", "cancelled")
 
             return action
