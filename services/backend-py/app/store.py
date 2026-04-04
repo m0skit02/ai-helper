@@ -12,6 +12,8 @@ from .schemas import (
     ConversationMessageCreateResponse,
     ConversationResponse,
     MessageItem,
+    NewsItem,
+    ProductItem,
     TaskCreateRequest,
     TaskResponse,
     TaskResult,
@@ -33,6 +35,13 @@ class TaskStore:
         self._conversations: dict[str, ConversationResponse] = {}
         self._messages: dict[str, list[MessageItem]] = {}
         self._tools = tools_client
+
+    def reset_for_tests(self, tools_client: ToolsClient | None = None) -> None:
+        with self._lock:
+            self._tasks.clear()
+            self._conversations.clear()
+            self._messages.clear()
+            self._tools = tools_client
 
     def _append_trace(
         self,
@@ -97,6 +106,71 @@ class TaskStore:
             conv.updated_at = now
             self._conversations[conversation_id] = conv
 
+    def _normalize_product(self, payload: dict[str, Any] | None) -> ProductItem:
+        p = payload or {}
+
+        def as_float(value: Any) -> float | None:
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def as_int(value: Any) -> int | None:
+            if value is None:
+                return None
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        return ProductItem(
+            title=str(p.get("title", "")),
+            price=as_float(p.get("price")),
+            currency=(str(p["currency"]) if p.get("currency") is not None else None),
+            url=str(p.get("url", "")),
+            seller=(str(p["seller"]) if p.get("seller") is not None else None),
+            rating=as_float(p.get("rating")),
+            reviews_count=as_int(p.get("reviews_count")),
+            delivery=(str(p["delivery"]) if p.get("delivery") is not None else None),
+            condition=(str(p["condition"]) if p.get("condition") is not None else None),
+            storage_gb=as_int(p.get("storage_gb")),
+        )
+
+    def _normalize_news(self, items: Any) -> list[NewsItem]:
+        if not isinstance(items, list):
+            return []
+        normalized: list[NewsItem] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            normalized.append(
+                NewsItem(
+                    title=str(raw.get("title", "")),
+                    summary=str(raw.get("summary", "")),
+                    published_at=(str(raw["published_at"]) if raw.get("published_at") is not None else None),
+                    url=str(raw.get("url", "")),
+                    source=(str(raw["source"]) if raw.get("source") is not None else None),
+                )
+            )
+        return normalized
+
+    def _normalize_sources(self, items: Any) -> list[str]:
+        if not isinstance(items, list):
+            return []
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", "")).strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            dedup.append(url)
+        return dedup
+
     def create_task(self, req: TaskCreateRequest, conversation_id: str | None = None) -> TaskResponse:
         task_id = str(uuid4())
         trace_id = str(uuid4())
@@ -112,7 +186,7 @@ class TaskStore:
 
         # MVP stub result so frontend can integrate immediately.
         result = TaskResult(
-            product={"title": "pending", "url": "", "price": None},
+            product=self._normalize_product({"title": "pending", "url": "", "price": None}),
             news=[],
             sources=[],
             actions=[],
@@ -150,10 +224,11 @@ class TaskStore:
             if isinstance(extract_product_resp, dict)
             else []
         )
-        if product_items:
-            result.product = product_items[0]
+        if isinstance(product_items, list) and product_items:
+            first = product_items[0] if isinstance(product_items[0], dict) else {}
+            result.product = self._normalize_product(first)
         else:
-            result.product = {"title": "pending", "url": "", "price": None}
+            result.product = self._normalize_product({"title": "pending", "url": "", "price": None})
 
         extract_news_resp = self._call_tool(
             trace=trace,
@@ -174,13 +249,11 @@ class TaskStore:
             if isinstance(extract_news_resp, dict)
             else []
         )
-        if isinstance(news_items, list):
-            result.news = news_items
+        result.news = self._normalize_news(news_items)
 
         if isinstance(search_resp, dict):
             results = search_resp.get("output", {}).get("results", [])
-            if isinstance(results, list):
-                result.sources = [item.get("url", "") for item in results if isinstance(item, dict)]
+            result.sources = self._normalize_sources(results)
 
         if req.allow_social_actions and requires_message_action(req.query):
             draft_resp = self._call_tool(
@@ -216,6 +289,8 @@ class TaskStore:
                 )
             )
             status = "needs_confirmation"
+        else:
+            status = "done"
 
         task = TaskResponse(
             task_id=task_id,
@@ -262,7 +337,8 @@ class TaskStore:
                 )
                 if isinstance(send_resp, dict) and send_resp.get("ok", True):
                     action.status = "sent"
-                    task.status = "running"
+                    task.status = "done"
+                    task.error = None
                     self._set_assistant_message_for_task(
                         task.conversation_id,
                         task.task_id,
@@ -291,8 +367,8 @@ class TaskStore:
                     )
             else:
                 action.status = "cancelled"
-                task.status = "failed"
-                task.error = "Action rejected by user"
+                task.status = "done"
+                task.error = None
                 self._set_assistant_message_for_task(
                     task.conversation_id,
                     task.task_id,
