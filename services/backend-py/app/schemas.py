@@ -31,9 +31,30 @@ class ActionItem(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProductItem(BaseModel):
+    title: str = ""
+    price: float | None = None
+    currency: str | None = None
+    url: str = ""
+    seller: str | None = None
+    rating: float | None = None
+    reviews_count: int | None = None
+    delivery: str | None = None
+    condition: str | None = None
+    storage_gb: int | None = None
+
+
+class NewsItem(BaseModel):
+    title: str = ""
+    summary: str = ""
+    published_at: str | None = None
+    url: str = ""
+    source: str | None = None
+
+
 class TaskResult(BaseModel):
-    product: dict[str, Any] | None = None
-    news: list[dict[str, Any]] = Field(default_factory=list)
+    product: ProductItem | None = None
+    news: list[NewsItem] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
     actions: list[ActionItem] = Field(default_factory=list)
 

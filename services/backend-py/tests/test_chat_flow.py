@@ -103,11 +103,7 @@ class FakeToolsClient:
 
 @pytest.fixture()
 def client() -> TestClient:
-    with store._lock:
-        store._tasks.clear()
-        store._conversations.clear()
-        store._messages.clear()
-        store._tools = FakeToolsClient()
+    store.reset_for_tests(tools_client=FakeToolsClient())
     return TestClient(app)
 
 
@@ -118,7 +114,7 @@ def test_task_has_session_id(client: TestClient) -> None:
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "running"
+    assert data["status"] == "done"
     assert data["session_id"] == "sess-1"
 
 
@@ -143,6 +139,7 @@ def test_confirm_approve_updates_assistant_message(client: TestClient) -> None:
     assert confirm.json()["status"] == "sent"
 
     task_after = client.get(f"/task/{task['task_id']}").json()
+    assert task_after["status"] == "done"
     assert task_after["result"]["actions"][0]["status"] == "sent"
 
     messages = client.get(f"/chat/conversations/{cid}/messages").json()["items"]
@@ -169,6 +166,7 @@ def test_confirm_reject_updates_assistant_message(client: TestClient) -> None:
     assert confirm.json()["status"] == "cancelled"
 
     task_after = client.get(f"/task/{task['task_id']}").json()
+    assert task_after["status"] == "done"
     assert task_after["result"]["actions"][0]["status"] == "cancelled"
 
     messages = client.get(f"/chat/conversations/{cid}/messages").json()["items"]

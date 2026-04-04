@@ -12,11 +12,12 @@ from .schemas import (
     TaskCreateRequest,
     TaskResponse,
 )
+from .llm_client import LLMClient
 from .store import TaskStore
 from .tools_client import ToolsClient
 
 app = FastAPI(title="ai-helper-backend")
-store = TaskStore(tools_client=ToolsClient())
+store = TaskStore(tools_client=ToolsClient(), llm_client=LLMClient())
 
 
 @app.get("/health")

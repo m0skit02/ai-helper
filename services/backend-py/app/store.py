@@ -5,6 +5,7 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 
+from .llm_client import LLMClient, LLMClientError
 from .schemas import (
     ActionConfirmRequest,
     ActionItem,
@@ -12,6 +13,8 @@ from .schemas import (
     ConversationMessageCreateResponse,
     ConversationResponse,
     MessageItem,
+    NewsItem,
+    ProductItem,
     TaskCreateRequest,
     TaskResponse,
     TaskResult,
@@ -27,12 +30,29 @@ def requires_message_action(query: str) -> bool:
 
 
 class TaskStore:
-    def __init__(self, tools_client: ToolsClient | None = None) -> None:
+    def __init__(
+        self,
+        tools_client: ToolsClient | None = None,
+        llm_client: LLMClient | None = None,
+    ) -> None:
         self._lock = Lock()
         self._tasks: dict[str, TaskResponse] = {}
         self._conversations: dict[str, ConversationResponse] = {}
         self._messages: dict[str, list[MessageItem]] = {}
         self._tools = tools_client
+        self._llm = llm_client
+
+    def reset_for_tests(
+        self,
+        tools_client: ToolsClient | None = None,
+        llm_client: LLMClient | None = None,
+    ) -> None:
+        with self._lock:
+            self._tasks.clear()
+            self._conversations.clear()
+            self._messages.clear()
+            self._tools = tools_client
+            self._llm = llm_client
 
     def _append_trace(
         self,
@@ -97,6 +117,110 @@ class TaskStore:
             conv.updated_at = now
             self._conversations[conversation_id] = conv
 
+    def _normalize_product(self, payload: dict[str, Any] | None) -> ProductItem:
+        p = payload or {}
+
+        def as_float(value: Any) -> float | None:
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def as_int(value: Any) -> int | None:
+            if value is None:
+                return None
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        return ProductItem(
+            title=str(p.get("title", "")),
+            price=as_float(p.get("price")),
+            currency=(str(p["currency"]) if p.get("currency") is not None else None),
+            url=str(p.get("url", "")),
+            seller=(str(p["seller"]) if p.get("seller") is not None else None),
+            rating=as_float(p.get("rating")),
+            reviews_count=as_int(p.get("reviews_count")),
+            delivery=(str(p["delivery"]) if p.get("delivery") is not None else None),
+            condition=(str(p["condition"]) if p.get("condition") is not None else None),
+            storage_gb=as_int(p.get("storage_gb")),
+        )
+
+    def _normalize_news(self, items: Any) -> list[NewsItem]:
+        if not isinstance(items, list):
+            return []
+        normalized: list[NewsItem] = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            normalized.append(
+                NewsItem(
+                    title=str(raw.get("title", "")),
+                    summary=str(raw.get("summary", "")),
+                    published_at=(str(raw["published_at"]) if raw.get("published_at") is not None else None),
+                    url=str(raw.get("url", "")),
+                    source=(str(raw["source"]) if raw.get("source") is not None else None),
+                )
+            )
+        return normalized
+
+    def _normalize_sources(self, items: Any) -> list[str]:
+        if not isinstance(items, list):
+            return []
+        dedup: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", "")).strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            dedup.append(url)
+        return dedup
+
+    def _fallback_plan(self, query: str) -> dict[str, Any]:
+        wants_message = requires_message_action(query)
+        q = query.lower()
+        wants_news = any(token in q for token in ("новост", "news", "статья"))
+        wants_product = any(token in q for token in ("купи", "найди", "iphone", "товар", "price", "цена"))
+        if not wants_news and not wants_product and not wants_message:
+            wants_product = True
+        return {
+            "wants_product": wants_product,
+            "wants_news": wants_news,
+            "wants_message": wants_message,
+            "search_query": query,
+            "news_topic": query,
+            "destination_hint": query,
+            "message_text": query,
+        }
+
+    def _plan_query(self, query: str, trace: list[TraceItem]) -> dict[str, Any]:
+        fallback = self._fallback_plan(query)
+        if self._llm is None or not self._llm.enabled():
+            self._append_trace(trace, "llm_plan_skipped", "no_llm", "llm.plan")
+            return fallback
+        try:
+            raw = self._llm.plan_query(query)
+            plan = {
+                "wants_product": bool(raw.get("wants_product", fallback["wants_product"])),
+                "wants_news": bool(raw.get("wants_news", fallback["wants_news"])),
+                "wants_message": bool(raw.get("wants_message", fallback["wants_message"])),
+                "search_query": str(raw.get("search_query") or fallback["search_query"]),
+                "news_topic": str(raw.get("news_topic") or fallback["news_topic"]),
+                "destination_hint": str(raw.get("destination_hint") or fallback["destination_hint"]),
+                "message_text": str(raw.get("message_text") or fallback["message_text"]),
+            }
+            self._append_trace(trace, "llm_plan_ok", "ok", "llm.plan")
+            return plan
+        except LLMClientError:
+            self._append_trace(trace, "llm_plan_failed", "fallback", "llm.plan")
+            return fallback
+
     def create_task(self, req: TaskCreateRequest, conversation_id: str | None = None) -> TaskResponse:
         task_id = str(uuid4())
         trace_id = str(uuid4())
@@ -109,10 +233,11 @@ class TaskStore:
                 ts=datetime.now(timezone.utc),
             )
         ]
+        plan = self._plan_query(req.query, trace)
 
         # MVP stub result so frontend can integrate immediately.
         result = TaskResult(
-            product={"title": "pending", "url": "", "price": None},
+            product=self._normalize_product({"title": "pending", "url": "", "price": None}),
             news=[],
             sources=[],
             actions=[],
@@ -126,71 +251,74 @@ class TaskStore:
             trace_id=trace_id,
             tool="browser.search",
             session_id=session_id,
-            input_data={"query": req.query, "engine": "yandex", "limit": 5},
+            input_data={"query": plan["search_query"], "engine": "yandex", "limit": 5},
         )
         if search_resp and isinstance(search_resp, dict):
             session_id = search_resp.get("session_id") or session_id
 
-        extract_product_resp = self._call_tool(
-            trace=trace,
-            trace_id=trace_id,
-            tool="browser.extract",
-            session_id=session_id,
-            input_data={
-                "schema": {
-                    "type": "product",
-                    "fields": ["title", "price", "currency", "url"],
+        extract_product_resp = None
+        if plan["wants_product"]:
+            extract_product_resp = self._call_tool(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.extract",
+                session_id=session_id,
+                input_data={
+                    "schema": {
+                        "type": "product",
+                        "fields": ["title", "price", "currency", "url"],
+                    },
+                    "mode": "dom_first",
+                    "limit": 5,
                 },
-                "mode": "dom_first",
-                "limit": 5,
-            },
-        )
+            )
         product_items = (
             extract_product_resp.get("output", {}).get("items", [])
             if isinstance(extract_product_resp, dict)
             else []
         )
-        if product_items:
-            result.product = product_items[0]
+        if isinstance(product_items, list) and product_items:
+            first = product_items[0] if isinstance(product_items[0], dict) else {}
+            result.product = self._normalize_product(first)
         else:
-            result.product = {"title": "pending", "url": "", "price": None}
+            result.product = self._normalize_product({"title": "pending", "url": "", "price": None})
 
-        extract_news_resp = self._call_tool(
-            trace=trace,
-            trace_id=trace_id,
-            tool="browser.extract",
-            session_id=session_id,
-            input_data={
-                "schema": {
-                    "type": "news",
-                    "fields": ["title", "summary", "published_at", "url", "source"],
+        extract_news_resp = None
+        if plan["wants_news"]:
+            extract_news_resp = self._call_tool(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.extract",
+                session_id=session_id,
+                input_data={
+                    "schema": {
+                        "type": "news",
+                        "fields": ["title", "summary", "published_at", "url", "source"],
+                    },
+                    "mode": "dom_first",
+                    "limit": 5,
                 },
-                "mode": "dom_first",
-                "limit": 5,
-            },
-        )
+            )
         news_items = (
             extract_news_resp.get("output", {}).get("items", [])
             if isinstance(extract_news_resp, dict)
             else []
         )
-        if isinstance(news_items, list):
-            result.news = news_items
+        result.news = self._normalize_news(news_items)
 
         if isinstance(search_resp, dict):
             results = search_resp.get("output", {}).get("results", [])
-            if isinstance(results, list):
-                result.sources = [item.get("url", "") for item in results if isinstance(item, dict)]
+            result.sources = self._normalize_sources(results)
 
-        if req.allow_social_actions and requires_message_action(req.query):
+        if req.allow_social_actions and bool(plan["wants_message"]):
             draft_resp = self._call_tool(
                 trace=trace,
                 trace_id=trace_id,
                 tool="browser.message.draft",
                 session_id=session_id,
                 input_data={
-                    "destination_hint": req.query,
-                    "message_text": req.query,
+                    "destination_hint": plan["destination_hint"],
+                    "message_text": plan["message_text"],
                 },
             )
 
@@ -203,8 +331,8 @@ class TaskStore:
             else:
                 action_id = str(uuid4())
                 payload = {
-                    "destination_hint": req.query,
-                    "message_text": req.query,
+                    "destination_hint": plan["destination_hint"],
+                    "message_text": plan["message_text"],
                 }
 
             result.actions.append(
@@ -216,6 +344,8 @@ class TaskStore:
                 )
             )
             status = "needs_confirmation"
+        else:
+            status = "done"
 
         task = TaskResponse(
             task_id=task_id,
@@ -262,7 +392,8 @@ class TaskStore:
                 )
                 if isinstance(send_resp, dict) and send_resp.get("ok", True):
                     action.status = "sent"
-                    task.status = "running"
+                    task.status = "done"
+                    task.error = None
                     self._set_assistant_message_for_task(
                         task.conversation_id,
                         task.task_id,
@@ -291,8 +422,8 @@ class TaskStore:
                     )
             else:
                 action.status = "cancelled"
-                task.status = "failed"
-                task.error = "Action rejected by user"
+                task.status = "done"
+                task.error = None
                 self._set_assistant_message_for_task(
                     task.conversation_id,
                     task.task_id,
@@ -332,7 +463,14 @@ class TaskStore:
                 return None
             return list(items)
 
-    def _build_assistant_text(self, task: TaskResponse) -> str:
+    def _build_assistant_text(self, query: str, task: TaskResponse) -> str:
+        if self._llm is not None and self._llm.enabled():
+            try:
+                payload = task.model_dump(mode="json")
+                return self._llm.summarize_task(query=query, task_status=task.status, result=payload.get("result", {}))
+            except LLMClientError:
+                pass
+
         if task.status == "needs_confirmation":
             return "Требуется подтверждение действия перед отправкой сообщения."
 
@@ -379,7 +517,7 @@ class TaskStore:
             message_id=str(uuid4()),
             conversation_id=conversation_id,
             role="assistant",
-            content=self._build_assistant_text(task),
+            content=self._build_assistant_text(req.content, task),
             created_at=datetime.now(timezone.utc),
             task_id=task.task_id,
         )
