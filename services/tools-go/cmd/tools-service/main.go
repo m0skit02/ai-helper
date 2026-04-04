@@ -2,12 +2,18 @@ package main
 
 import (
 	"encoding/json"
+	"encoding/xml"
+	"html"
+	"io"
 	"log"
 	"net/http"
+	neturl "net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -43,16 +49,62 @@ type DraftMessage struct {
 	CreatedAt       time.Time
 }
 
+type SearchResult struct {
+	Title   string
+	URL     string
+	Snippet string
+}
+
+type NewsItem struct {
+	Title       string
+	Summary     string
+	PublishedAt string
+	URL         string
+	Source      string
+}
+
+type SessionState struct {
+	UpdatedAt         time.Time
+	LastQuery         string
+	LastSearchResults []SearchResult
+	LastNewsItems     []NewsItem
+}
+
+type rssFeed struct {
+	Channel rssChannel `xml:"channel"`
+}
+
+type rssChannel struct {
+	Title string    `xml:"title"`
+	Items []rssItem `xml:"item"`
+}
+
+type rssItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	PubDate     string `xml:"pubDate"`
+	Source      string `xml:"source"`
+}
+
 type ToolServer struct {
-	mu       sync.Mutex
-	drafts   map[string]DraftMessage
-	sessions map[string]time.Time
+	mu            sync.Mutex
+	drafts        map[string]DraftMessage
+	sessions      map[string]*SessionState
+	httpClient    *http.Client
+	tagStripper   *regexp.Regexp
+	maxNewsItems  int
+	maxSearchRows int
 }
 
 func newToolServer() *ToolServer {
 	return &ToolServer{
-		drafts:   make(map[string]DraftMessage),
-		sessions: make(map[string]time.Time),
+		drafts:        make(map[string]DraftMessage),
+		sessions:      make(map[string]*SessionState),
+		httpClient:    &http.Client{Timeout: 20 * time.Second},
+		tagStripper:   regexp.MustCompile("<[^>]+>"),
+		maxNewsItems:  5,
+		maxSearchRows: 5,
 	}
 }
 
@@ -62,8 +114,37 @@ func (s *ToolServer) ensureSession(sessionID string) string {
 	if strings.TrimSpace(sessionID) == "" {
 		sessionID = "sess-" + uuid.NewString()
 	}
-	s.sessions[sessionID] = time.Now().UTC()
+	state, ok := s.sessions[sessionID]
+	if !ok {
+		state = &SessionState{}
+		s.sessions[sessionID] = state
+	}
+	state.UpdatedAt = time.Now().UTC()
 	return sessionID
+}
+
+func (s *ToolServer) updateSessionSearch(sessionID, query string, results []SearchResult, news []NewsItem) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.sessions[sessionID]
+	if !ok {
+		state = &SessionState{}
+		s.sessions[sessionID] = state
+	}
+	state.UpdatedAt = time.Now().UTC()
+	state.LastQuery = query
+	state.LastSearchResults = append([]SearchResult(nil), results...)
+	state.LastNewsItems = append([]NewsItem(nil), news...)
+}
+
+func (s *ToolServer) getSessionNews(sessionID string) []NewsItem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.sessions[sessionID]
+	if !ok {
+		return nil
+	}
+	return append([]NewsItem(nil), state.LastNewsItems...)
 }
 
 func (s *ToolServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -96,19 +177,14 @@ func (s *ToolServer) handleCallTool(w http.ResponseWriter, r *http.Request) {
 	switch req.Tool {
 	case "browser.search":
 		query := asString(req.Input["query"])
+		results, news, err := s.fetchNewsSearch(query)
+		if err != nil || len(results) == 0 {
+			results = s.fallbackSearchResults(query)
+			news = nil
+		}
+		s.updateSessionSearch(sessionID, query, results, news)
 		resp.Output = map[string]interface{}{
-			"results": []map[string]interface{}{
-				{
-					"title":   "Mock result: " + query,
-					"url":     "https://example.com/search?q=" + query,
-					"snippet": "Mock search result from tools-go",
-				},
-				{
-					"title":   "Mock marketplace listing",
-					"url":     "https://example.com/product/iphone-256",
-					"snippet": "iPhone 256 mock listing",
-				},
-			},
+			"results": searchResultsToMaps(results),
 		}
 	case "browser.extract":
 		schemaType := ""
@@ -117,16 +193,12 @@ func (s *ToolServer) handleCallTool(w http.ResponseWriter, r *http.Request) {
 		}
 		switch schemaType {
 		case "news":
+			items := s.getSessionNews(sessionID)
+			if len(items) == 0 {
+				items = []NewsItem{}
+			}
 			resp.Output = map[string]interface{}{
-				"items": []map[string]interface{}{
-					{
-						"title":        "Apple announces mock update",
-						"summary":      "Mock news summary for MVP integration.",
-						"published_at": time.Now().UTC().Format(time.RFC3339),
-						"url":          "https://example.com/news/apple-update",
-						"source":       "example",
-					},
-				},
+				"items": newsItemsToMaps(items),
 			}
 		default:
 			resp.Output = map[string]interface{}{
@@ -210,6 +282,170 @@ func (s *ToolServer) handleCallTool(w http.ResponseWriter, r *http.Request) {
 
 	resp.DurationMS = time.Since(start).Milliseconds()
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *ToolServer) fetchNewsSearch(query string) ([]SearchResult, []NewsItem, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil, nil
+	}
+
+	lang := "en"
+	region := "US"
+	if containsCyrillic(query) {
+		lang = "ru"
+		region = "RU"
+	}
+
+	endpoint := "https://news.google.com/rss/search?q=" + neturl.QueryEscape(query) +
+		"&hl=" + lang + "&gl=" + region + "&ceid=" + region + ":" + lang
+
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("User-Agent", "ai-helper-tools-go/0.1")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, io.ErrUnexpectedEOF
+	}
+
+	var feed rssFeed
+	if err := xml.NewDecoder(resp.Body).Decode(&feed); err != nil {
+		return nil, nil, err
+	}
+
+	results := make([]SearchResult, 0, s.maxSearchRows)
+	items := make([]NewsItem, 0, s.maxNewsItems)
+	for _, item := range feed.Channel.Items {
+		link := strings.TrimSpace(item.Link)
+		title := cleanText(item.Title)
+		if link == "" || title == "" {
+			continue
+		}
+		summary := cleanText(item.Description)
+		if summary == "" {
+			summary = title
+		}
+		source := cleanText(item.Source)
+		if source == "" {
+			source = "Google News"
+		}
+
+		results = append(results, SearchResult{
+			Title:   title,
+			URL:     link,
+			Snippet: summary,
+		})
+		items = append(items, NewsItem{
+			Title:       title,
+			Summary:     summary,
+			PublishedAt: normalizePubDate(item.PubDate),
+			URL:         link,
+			Source:      source,
+		})
+		if len(results) >= s.maxSearchRows && len(items) >= s.maxNewsItems {
+			break
+		}
+	}
+
+	if len(results) > s.maxSearchRows {
+		results = results[:s.maxSearchRows]
+	}
+	if len(items) > s.maxNewsItems {
+		items = items[:s.maxNewsItems]
+	}
+
+	return results, items, nil
+}
+
+func (s *ToolServer) fallbackSearchResults(query string) []SearchResult {
+	return []SearchResult{
+		{
+			Title:   "Mock result: " + query,
+			URL:     "https://example.com/search?q=" + neturl.QueryEscape(query),
+			Snippet: "Mock search result from tools-go",
+		},
+		{
+			Title:   "Mock marketplace listing",
+			URL:     "https://example.com/product/iphone-256",
+			Snippet: "iPhone 256 mock listing",
+		},
+	}
+}
+
+func searchResultsToMaps(items []SearchResult) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(items))
+	for _, item := range items {
+		out = append(out, map[string]interface{}{
+			"title":   item.Title,
+			"url":     item.URL,
+			"snippet": item.Snippet,
+		})
+	}
+	return out
+}
+
+func newsItemsToMaps(items []NewsItem) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(items))
+	for _, item := range items {
+		out = append(out, map[string]interface{}{
+			"title":        item.Title,
+			"summary":      item.Summary,
+			"published_at": item.PublishedAt,
+			"url":          item.URL,
+			"source":       item.Source,
+		})
+	}
+	return out
+}
+
+func normalizePubDate(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Now().UTC().Format(time.RFC3339)
+	}
+	layouts := []string{
+		time.RFC1123Z,
+		time.RFC1123,
+		time.RFC822Z,
+		time.RFC822,
+		time.RFC3339,
+	}
+	for _, layout := range layouts {
+		parsed, err := time.Parse(layout, raw)
+		if err == nil {
+			return parsed.UTC().Format(time.RFC3339)
+		}
+	}
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+func cleanText(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	raw = html.UnescapeString(raw)
+	re := regexp.MustCompile("<[^>]+>")
+	raw = re.ReplaceAllString(raw, " ")
+	raw = strings.Join(strings.Fields(raw), " ")
+	return raw
+}
+
+func containsCyrillic(s string) bool {
+	for _, r := range s {
+		if unicode.In(r, unicode.Cyrillic) {
+			return true
+		}
+	}
+	return false
 }
 
 func asString(v interface{}) string {

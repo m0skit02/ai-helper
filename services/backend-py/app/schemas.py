@@ -22,6 +22,7 @@ class TraceItem(BaseModel):
     status: str
     ts: datetime
     tool: str | None = None
+    detail: str | None = None
 
 
 class ActionItem(BaseModel):

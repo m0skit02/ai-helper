@@ -60,12 +60,14 @@ class TaskStore:
         step: str,
         status: str,
         tool: str | None = None,
+        detail: str | None = None,
     ) -> None:
         trace.append(
             TraceItem(
                 step=step,
                 status=status,
                 tool=tool,
+                detail=detail,
                 ts=datetime.now(timezone.utc),
             )
         )
@@ -217,8 +219,14 @@ class TaskStore:
             }
             self._append_trace(trace, "llm_plan_ok", "ok", "llm.plan")
             return plan
-        except LLMClientError:
-            self._append_trace(trace, "llm_plan_failed", "fallback", "llm.plan")
+        except LLMClientError as exc:
+            self._append_trace(
+                trace,
+                "llm_plan_failed",
+                "fallback",
+                "llm.plan",
+                detail=f"{exc.category}: {exc.message}",
+            )
             return fallback
 
     def create_task(self, req: TaskCreateRequest, conversation_id: str | None = None) -> TaskResponse:

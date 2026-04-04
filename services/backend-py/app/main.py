@@ -25,6 +25,14 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/debug/llm")
+def debug_llm() -> dict[str, object]:
+    llm = store._llm
+    if llm is None:
+        return {"enabled": False, "status": "no_client"}
+    return llm.healthcheck()
+
+
 @app.post("/task", response_model=TaskResponse)
 def create_task(req: TaskCreateRequest) -> TaskResponse:
     return store.create_task(req)

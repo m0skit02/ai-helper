@@ -2,34 +2,125 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from typing import Any
 from urllib import error, request
 
 
 class LLMClientError(Exception):
-    pass
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.message = message
+        self.status_code = status_code
 
 
 class LLMClient:
     def __init__(self) -> None:
         self.api_key = os.getenv("OPENAI_API_KEY")
-        self.model = os.getenv("OPENAI_MODEL", "gpt-5")
+        self.model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         self.url = os.getenv("OPENAI_URL", "https://api.openai.com/v1/chat/completions")
         self.timeout_seconds = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
 
     def enabled(self) -> bool:
         return bool(self.api_key)
 
+    def _classify_http_error(self, exc: error.HTTPError) -> LLMClientError:
+        status = exc.code
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+
+        if status in (401, 403):
+            category = "auth"
+        elif status == 404:
+            category = "model"
+        elif status == 429:
+            category = "rate_limit"
+        elif status == 408:
+            category = "timeout"
+        elif status == 400 and any(token in body.lower() for token in ("model", "unsupported", "not found")):
+            category = "model"
+        else:
+            category = "http_error"
+
+        detail = f"http_{status}"
+        if body:
+            detail = f"{detail}: {body[:240]}"
+        return LLMClientError(category, detail, status_code=status)
+
+    def _classify_network_error(self, exc: Exception) -> LLMClientError:
+        if isinstance(exc, TimeoutError | socket.timeout):
+            return LLMClientError("timeout", "request timed out")
+        if isinstance(exc, error.URLError):
+            reason = exc.reason
+            if isinstance(reason, TimeoutError | socket.timeout):
+                return LLMClientError("timeout", "request timed out")
+            return LLMClientError("network", str(reason))
+        return LLMClientError("network", str(exc))
+
+    def _extract_text_content(self, data: dict[str, Any]) -> str:
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise LLMClientError("invalid_response", "choices are missing")
+
+        message = choices[0].get("message", {})
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            joined = "\n".join(part for part in parts if part).strip()
+            if joined:
+                return joined
+
+        raise LLMClientError("invalid_response", "message content is missing")
+
+    def _parse_json_content(self, raw_text: str) -> dict[str, Any]:
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            lines = [line for line in cleaned.splitlines() if not line.startswith("```")]
+            cleaned = "\n".join(lines).strip()
+
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise LLMClientError("invalid_response", f"model returned non-json: {cleaned[:240]}") from exc
+
+        if not isinstance(parsed, dict):
+            raise LLMClientError("invalid_response", "model returned non-object json")
+        return parsed
+
     def _chat_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         if not self.enabled():
-            raise LLMClientError("OPENAI_API_KEY is not set")
+            raise LLMClientError("auth", "OPENAI_API_KEY is not set")
 
         payload = {
             "model": self.model,
             "temperature": 0,
-            "response_format": {"type": "json_object"},
             "messages": [
-                {"role": "system", "content": system_prompt},
+                {
+                    "role": "system",
+                    "content": (
+                        f"{system_prompt}\n"
+                        "Output only valid JSON. Do not wrap it in markdown. Do not add extra text."
+                    ),
+                },
                 {"role": "user", "content": user_prompt},
             ],
         }
@@ -42,18 +133,22 @@ class LLMClient:
             },
             method="POST",
         )
+
         try:
             with request.urlopen(req, timeout=self.timeout_seconds) as resp:
                 raw = resp.read().decode("utf-8")
-        except error.URLError as exc:
-            raise LLMClientError(str(exc)) from exc
+        except error.HTTPError as exc:
+            raise self._classify_http_error(exc) from exc
+        except (error.URLError, TimeoutError, socket.timeout) as exc:
+            raise self._classify_network_error(exc) from exc
 
         try:
             data = json.loads(raw)
-            content = data["choices"][0]["message"]["content"]
-            return json.loads(content)
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise LLMClientError("Invalid LLM response") from exc
+        except json.JSONDecodeError as exc:
+            raise LLMClientError("invalid_response", "openai returned invalid json") from exc
+
+        raw_text = self._extract_text_content(data)
+        return self._parse_json_content(raw_text)
 
     def plan_query(self, query: str) -> dict[str, Any]:
         system_prompt = (
@@ -79,4 +174,34 @@ class LLMClient:
         summary = data.get("summary")
         if isinstance(summary, str) and summary.strip():
             return summary.strip()
-        raise LLMClientError("Missing summary")
+        raise LLMClientError("invalid_response", "missing summary")
+
+    def healthcheck(self) -> dict[str, Any]:
+        if not self.enabled():
+            return {
+                "enabled": False,
+                "model": self.model,
+                "url": self.url,
+                "status": "no_key",
+            }
+
+        try:
+            data = self._chat_json(
+                "Return strict JSON: {\"ok\": true}.",
+                "Ping",
+            )
+            return {
+                "enabled": True,
+                "model": self.model,
+                "url": self.url,
+                "status": "ok" if data.get("ok") is True else "invalid_response",
+            }
+        except LLMClientError as exc:
+            return {
+                "enabled": True,
+                "model": self.model,
+                "url": self.url,
+                "status": "failed",
+                "error_category": exc.category,
+                "error": exc.message,
+            }

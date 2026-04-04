@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from app.llm_client import LLMClientError
 from app.main import app, store
 
 
@@ -101,6 +102,36 @@ class FakeToolsClient:
         raise AssertionError(f"unexpected tool {tool}")
 
 
+class FakeLLMClientOk:
+    def enabled(self) -> bool:
+        return True
+
+    def plan_query(self, query: str) -> dict[str, Any]:
+        return {
+            "wants_product": False,
+            "wants_news": True,
+            "wants_message": True,
+            "search_query": "openai news",
+            "news_topic": "OpenAI",
+            "destination_hint": "Сергей",
+            "message_text": "Короткая сводка по OpenAI.",
+        }
+
+    def summarize_task(self, query: str, task_status: str, result: dict[str, Any]) -> str:
+        return "stub summary"
+
+
+class FakeLLMClientFail:
+    def enabled(self) -> bool:
+        return True
+
+    def plan_query(self, query: str) -> dict[str, Any]:
+        raise LLMClientError("auth", "http_401: invalid api key")
+
+    def summarize_task(self, query: str, task_status: str, result: dict[str, Any]) -> str:
+        raise LLMClientError("auth", "http_401: invalid api key")
+
+
 @pytest.fixture()
 def client() -> TestClient:
     store.reset_for_tests(tools_client=FakeToolsClient())
@@ -172,3 +203,32 @@ def test_confirm_reject_updates_assistant_message(client: TestClient) -> None:
     messages = client.get(f"/chat/conversations/{cid}/messages").json()["items"]
     assistant = [m for m in messages if m["role"] == "assistant" and m["task_id"] == task["task_id"]][0]
     assert "отменено пользователем" in assistant["content"].lower()
+
+
+def test_llm_plan_success_trace(client: TestClient) -> None:
+    store.reset_for_tests(tools_client=FakeToolsClient(), llm_client=FakeLLMClientOk())
+
+    resp = client.post(
+        "/task",
+        json={"query": "Найди новости OpenAI и отправь сообщение Сергею", "allow_social_actions": True},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    llm_trace = [item for item in data["trace"] if item["step"] == "llm_plan_ok"]
+    assert llm_trace
+    assert data["status"] == "needs_confirmation"
+
+
+def test_llm_plan_failure_trace_contains_reason(client: TestClient) -> None:
+    store.reset_for_tests(tools_client=FakeToolsClient(), llm_client=FakeLLMClientFail())
+
+    resp = client.post(
+        "/task",
+        json={"query": "Найди новости OpenAI", "allow_social_actions": True},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    failed = [item for item in data["trace"] if item["step"] == "llm_plan_failed"][0]
+    assert failed["detail"] == "auth: http_401: invalid api key"
