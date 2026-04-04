@@ -93,8 +93,14 @@ class TaskStore:
             )
             self._append_trace(trace, f"{tool}_ok", "ok", tool)
             return resp
-        except ToolsClientError:
-            self._append_trace(trace, f"{tool}_failed", "fallback", tool)
+        except ToolsClientError as exc:
+            self._append_trace(
+                trace,
+                f"{tool}_failed",
+                "fallback",
+                tool,
+                detail=f"{exc.category}: {exc.message}",
+            )
             return None
 
     def _set_assistant_message_for_task(
@@ -184,6 +190,103 @@ class TaskStore:
             dedup.append(url)
         return dedup
 
+    def _has_product_data(self, product: ProductItem | None) -> bool:
+        if product is None:
+            return False
+        title = product.title.strip().lower()
+        return bool(
+            (title and title != "pending")
+            or product.price is not None
+            or product.url.strip()
+        )
+
+    def _merge_sources(self, *groups: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for item in group:
+                url = item.strip()
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                merged.append(url)
+        return merged
+
+    def _build_link_entries(self, task: TaskResponse) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        def add_entry(label: str, url: str) -> None:
+            clean_label = label.strip()
+            clean_url = url.strip()
+            if not clean_url or clean_url in seen:
+                return
+            seen.add(clean_url)
+            entries.append((clean_label or clean_url, clean_url))
+
+        if task.result is None:
+            return entries
+
+        if self._has_product_data(task.result.product) and task.result.product is not None:
+            add_entry(task.result.product.title or "Товар", task.result.product.url)
+
+        for item in task.result.news:
+            add_entry(item.title or "Новость", item.url)
+
+        for url in task.result.sources:
+            add_entry("Источник", url)
+
+        return entries
+
+    def _format_links_block(self, task: TaskResponse) -> str:
+        entries = self._build_link_entries(task)
+        if not entries:
+            return ""
+
+        lines = ["Ссылки:"]
+        for index, (label, url) in enumerate(entries[:5], start=1):
+            lines.append(f"{index}. {label}")
+            lines.append(url)
+        return "\n".join(lines)
+
+    def _build_fallback_summary(self, task: TaskResponse) -> str:
+        if task.status == "failed":
+            return "Не удалось выполнить задачу."
+
+        parts: list[str] = []
+        if task.result is not None and self._has_product_data(task.result.product) and task.result.product is not None:
+            product = task.result.product
+            product_line = f"Нашел товар: {product.title}"
+            if product.price is not None:
+                currency = f" {product.currency}" if product.currency else ""
+                product_line += f" за {product.price:g}{currency}"
+            parts.append(product_line + ".")
+
+        if task.result is not None and task.result.news:
+            news_titles = [item.title.strip() for item in task.result.news if item.title.strip()]
+            if news_titles:
+                preview = "; ".join(news_titles[:3])
+                parts.append(f"Нашел новости: {preview}.")
+
+        if not parts:
+            if task.status == "needs_confirmation":
+                return "Подготовил действие. Нужна ваша команда на подтверждение."
+            if task.status == "done":
+                return "Не удалось получить содержательные результаты по запросу."
+            return "Задача принята в обработку."
+
+        return " ".join(parts)
+
+    def _decorate_assistant_text(self, summary: str, task: TaskResponse) -> str:
+        sections = [summary.strip()]
+        links_block = self._format_links_block(task)
+        if links_block and "http://" not in summary and "https://" not in summary:
+            sections.append(links_block)
+
+        if task.status == "needs_confirmation":
+            sections.append("Подготовил сообщение. Подтвердите отправку.")
+        return "\n\n".join(part for part in sections if part)
+
     def _fallback_plan(self, query: str) -> dict[str, Any]:
         wants_message = requires_message_action(query)
         q = query.lower()
@@ -245,7 +348,7 @@ class TaskStore:
 
         # MVP stub result so frontend can integrate immediately.
         result = TaskResult(
-            product=self._normalize_product({"title": "pending", "url": "", "price": None}),
+            product=None,
             news=[],
             sources=[],
             actions=[],
@@ -288,8 +391,6 @@ class TaskStore:
         if isinstance(product_items, list) and product_items:
             first = product_items[0] if isinstance(product_items[0], dict) else {}
             result.product = self._normalize_product(first)
-        else:
-            result.product = self._normalize_product({"title": "pending", "url": "", "price": None})
 
         extract_news_resp = None
         if plan["wants_news"]:
@@ -314,9 +415,14 @@ class TaskStore:
         )
         result.news = self._normalize_news(news_items)
 
+        search_sources: list[str] = []
         if isinstance(search_resp, dict):
             results = search_resp.get("output", {}).get("results", [])
-            result.sources = self._normalize_sources(results)
+            search_sources = self._normalize_sources(results)
+
+        news_sources = [item.url for item in result.news if item.url.strip()]
+        product_sources = [result.product.url] if self._has_product_data(result.product) and result.product is not None else []
+        result.sources = self._merge_sources(product_sources, news_sources, search_sources)
 
         if req.allow_social_actions and bool(plan["wants_message"]):
             draft_resp = self._call_tool(
@@ -475,26 +581,16 @@ class TaskStore:
         if self._llm is not None and self._llm.enabled():
             try:
                 payload = task.model_dump(mode="json")
-                return self._llm.summarize_task(query=query, task_status=task.status, result=payload.get("result", {}))
+                summary = self._llm.summarize_task(
+                    query=query,
+                    task_status=task.status,
+                    result=payload.get("result", {}),
+                )
+                return self._decorate_assistant_text(summary, task)
             except LLMClientError:
                 pass
 
-        if task.status == "needs_confirmation":
-            return "Требуется подтверждение действия перед отправкой сообщения."
-
-        product_title = ""
-        if task.result and isinstance(task.result.product, dict):
-            product_title = str(task.result.product.get("title", "")).strip()
-
-        news_count = len(task.result.news) if task.result else 0
-        parts: list[str] = []
-        if product_title:
-            parts.append(f"Товар: {product_title}")
-        if news_count:
-            parts.append(f"Новости: {news_count}")
-        if not parts:
-            return "Задача принята в обработку."
-        return ". ".join(parts)
+        return self._decorate_assistant_text(self._build_fallback_summary(task), task)
 
     def add_message_and_create_task(
         self,

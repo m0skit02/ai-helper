@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.llm_client import LLMClientError
 from app.main import app, store
+from app.tools_client import ToolsClientError
 
 
 class FakeToolsClient:
@@ -132,6 +133,19 @@ class FakeLLMClientFail:
         raise LLMClientError("auth", "http_401: invalid api key")
 
 
+class FakeToolsClientSearchFail(FakeToolsClient):
+    def call_tool(
+        self,
+        tool: str,
+        session_id: str | None,
+        input_data: dict[str, Any],
+        trace_id: str,
+    ) -> dict[str, Any]:
+        if tool == "browser.search":
+            raise ToolsClientError("network", "connection refused")
+        return super().call_tool(tool=tool, session_id=session_id, input_data=input_data, trace_id=trace_id)
+
+
 @pytest.fixture()
 def client() -> TestClient:
     store.reset_for_tests(tools_client=FakeToolsClient())
@@ -232,3 +246,36 @@ def test_llm_plan_failure_trace_contains_reason(client: TestClient) -> None:
     data = resp.json()
     failed = [item for item in data["trace"] if item["step"] == "llm_plan_failed"][0]
     assert failed["detail"] == "auth: http_401: invalid api key"
+
+
+def test_assistant_summary_contains_links_and_confirmation_note(client: TestClient) -> None:
+    store.reset_for_tests(tools_client=FakeToolsClient(), llm_client=FakeLLMClientOk())
+
+    conv = client.post("/chat/conversations", json={"title": "Links"}).json()
+    cid = conv["conversation_id"]
+
+    created = client.post(
+        f"/chat/conversations/{cid}/messages",
+        json={"content": "Найди новости OpenAI и отправь сообщение Сергею", "allow_social_actions": True},
+    )
+
+    assert created.status_code == 200
+    assistant_message = created.json()["assistant_message"]["content"]
+    assert "stub summary" in assistant_message
+    assert "Ссылки:" in assistant_message
+    assert "https://example.com/news" in assistant_message
+    assert "Подтвердите отправку" in assistant_message
+
+
+def test_tool_failure_trace_contains_reason(client: TestClient) -> None:
+    store.reset_for_tests(tools_client=FakeToolsClientSearchFail(), llm_client=None)
+
+    resp = client.post(
+        "/task",
+        json={"query": "Найди новости OpenAI", "allow_social_actions": True},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    failed = [item for item in data["trace"] if item["step"] == "browser.search_failed"][0]
+    assert failed["detail"] == "network: connection refused"
