@@ -2,6 +2,10 @@
 
 Base URL: `http://127.0.0.1:8000`
 
+LLM behavior:
+- If `OPENAI_API_KEY` is set, backend uses LLM for query planning and assistant summary text.
+- If no key or LLM call fails, backend uses deterministic fallback logic.
+
 ## Chat
 
 ### Create conversation
