@@ -293,6 +293,7 @@ async function handleBrowserOpen(envelope) {
     }
 
     const activate = input.activate === true;
+    const reuseActiveTab = input.reuse_active_tab === true;
     let tab = null;
     const existingSession = browserSessions.get(sessionId);
 
@@ -304,6 +305,20 @@ async function handleBrowserOpen(envelope) {
             });
         } catch (_error) {
             browserSessions.delete(sessionId);
+        }
+    }
+
+    if (!tab && reuseActiveTab) {
+        try {
+            const activeTab = await resolveActiveTab();
+            if (activeTab?.id) {
+                tab = await chrome.tabs.update(activeTab.id, {
+                    url,
+                    active: true,
+                });
+            }
+        } catch (_error) {
+            tab = null;
         }
     }
 

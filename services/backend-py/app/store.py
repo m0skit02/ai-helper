@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 import traceback
 from datetime import datetime, timezone
 from threading import Lock
@@ -898,17 +899,163 @@ class TaskStore:
         session_id: str | None,
         query: str,
         engine: str = "yandex",
+        *,
+        reuse_active_tab: bool = False,
     ) -> tuple[str | None, ToolsClientError | None]:
         resp, err = self._call_tool_with_error(
             trace=trace,
             trace_id=trace_id,
             tool="browser.open",
             session_id=session_id,
-            input_data={"url": build_search_url(query, engine), "activate": False},
+            input_data={
+                "url": build_search_url(query, engine),
+                "activate": False,
+                "reuse_active_tab": reuse_active_tab,
+            },
         )
         if resp and isinstance(resp, dict):
             return resp.get("session_id") or session_id, None
         return session_id, err
+
+    def _run_informational_retrieval(
+        self,
+        query: str,
+        trace: list[TraceItem],
+        trace_id: str,
+        session_id: str | None,
+        plan: dict[str, Any],
+        result: TaskResult,
+    ) -> tuple[str | None, str | None]:
+        if not (plan["wants_product"] or plan["wants_news"]):
+            return session_id, None
+
+        self._append_trace(trace, "informational_flow", "ok", "router")
+        task_error: str | None = None
+        search_resp: dict[str, Any] | None = None
+        search_err: ToolsClientError | None = None
+
+        for attempt in range(1, 4):
+            search_resp, search_err = self._call_tool_with_error(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.search",
+                session_id=session_id,
+                input_data={"query": plan["search_query"], "engine": "yandex", "limit": 5},
+            )
+            if search_err is None and isinstance(search_resp, dict):
+                session_id = search_resp.get("session_id") or session_id
+                if attempt > 1:
+                    self._append_trace(
+                        trace,
+                        "browser.search_retry_recovered",
+                        "ok",
+                        "browser.search",
+                        detail=f"attempt={attempt}",
+                    )
+                break
+
+            if search_err is None:
+                break
+
+            if search_err.category in {"navigation_failed", "element_not_found"} and attempt < 3:
+                self._append_trace(
+                    trace,
+                    "browser.search_retry",
+                    "retry",
+                    "browser.search",
+                    detail=f"attempt={attempt} category={search_err.category}",
+                )
+                time.sleep(0.8 * attempt)
+                continue
+            break
+
+        if (search_err is not None or not isinstance(search_resp, dict)) and search_err is not None and search_err.category in {
+            "navigation_failed",
+            "element_not_found",
+        }:
+            session_id, open_err = self._open_search_page(
+                trace,
+                trace_id,
+                session_id,
+                plan["search_query"],
+                "yandex",
+                reuse_active_tab=True,
+            )
+            if open_err is None:
+                search_resp, search_err = self._call_tool_with_error(
+                    trace=trace,
+                    trace_id=trace_id,
+                    tool="browser.search",
+                    session_id=session_id,
+                    input_data={"query": plan["search_query"], "engine": "yandex", "limit": 5},
+                )
+                if isinstance(search_resp, dict):
+                    session_id = search_resp.get("session_id") or session_id
+            else:
+                search_err = open_err
+
+        if search_err is not None and task_error is None:
+            task_error = self._humanize_tool_error("browser.search", search_err, query)
+
+        extract_product_resp = None
+        if plan["wants_product"]:
+            extract_product_resp = self._call_tool(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.extract",
+                session_id=session_id,
+                input_data={
+                    "schema": {
+                        "type": "product",
+                        "fields": ["title", "price", "currency", "url"],
+                    },
+                    "mode": "dom_first",
+                    "limit": 5,
+                },
+            )
+
+        product_items = (
+            extract_product_resp.get("output", {}).get("items", [])
+            if isinstance(extract_product_resp, dict)
+            else []
+        )
+        if isinstance(product_items, list) and product_items:
+            first = product_items[0] if isinstance(product_items[0], dict) else {}
+            result.product = self._normalize_product(first)
+
+        extract_news_resp = None
+        if plan["wants_news"]:
+            extract_news_resp = self._call_tool(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.extract",
+                session_id=session_id,
+                input_data={
+                    "schema": {
+                        "type": "news",
+                        "fields": ["title", "summary", "published_at", "url", "source"],
+                    },
+                    "mode": "dom_first",
+                    "limit": 10,
+                },
+            )
+
+        news_items = (
+            extract_news_resp.get("output", {}).get("items", [])
+            if isinstance(extract_news_resp, dict)
+            else []
+        )
+        result.news = self._normalize_news(news_items)
+
+        search_sources: list[str] = []
+        if isinstance(search_resp, dict):
+            results = search_resp.get("output", {}).get("results", [])
+            search_sources = self._normalize_sources(results)
+
+        news_sources = [item.url for item in result.news if item.url.strip()]
+        product_sources = [result.product.url] if self._has_product_data(result.product) and result.product is not None else []
+        result.sources = self._merge_sources(product_sources, news_sources, search_sources)
+        return session_id, task_error
 
     def _scan_page_with_retry(
         self,
@@ -2292,6 +2439,9 @@ class TaskStore:
             "site_url": site_url,
         }
 
+        if intent == "news_summary" and not is_open_site_request_clean(query):
+            normalized["request_route"] = "informational_request"
+
         normalized["wants_product"] = intent == "find_product"
         normalized["wants_news"] = intent == "news_summary"
         normalized["wants_message"] = intent in {"send_message", "bulk_message"}
@@ -2337,6 +2487,19 @@ class TaskStore:
         else:
             self._append_trace(trace, "rule_plan_general", "ok", "rule.plan")
         return plan
+
+    def _should_prefer_llm_only_informational_answer(self, plan: dict[str, Any], query: str) -> bool:
+        if not (self._llm is not None and self._llm.enabled()):
+            return False
+        if plan.get("request_route") != "informational_request":
+            return False
+        if not plan.get("wants_news"):
+            return False
+        if plan.get("wants_message") or plan.get("supports_browser_action"):
+            return False
+        if is_open_site_request_clean(query):
+            return False
+        return True
 
     def create_task(self, req: TaskCreateRequest, conversation_id: str | None = None) -> TaskResponse:
         task_id = str(uuid4())
@@ -2393,78 +2556,34 @@ class TaskStore:
                 self._tasks[task_id] = task
             return task
 
-        # Universal product/news retrieval pipeline.
-        search_resp = None
+        if self._should_prefer_llm_only_informational_answer(plan, req.query):
+            self._append_trace(trace, "informational_llm_only", "ok", "llm.answer")
+            status = "done"
+            task = TaskResponse(
+                task_id=task_id,
+                trace_id=trace_id,
+                status=status,
+                conversation_id=conversation_id,
+                session_id=session_id,
+                result=result,
+                trace=trace,
+                error=None,
+            )
+            with self._lock:
+                self._tasks[task_id] = task
+            return task
+
         if has_search_work:
-            session_id, search_open_err = self._open_search_page(trace, trace_id, session_id, plan["search_query"])
-            if search_open_err is not None:
-                task_error = self._humanize_tool_error("browser.open", search_open_err, req.query)
-            search_resp = self._call_tool(
+            session_id, informational_error = self._run_informational_retrieval(
+                query=req.query,
                 trace=trace,
                 trace_id=trace_id,
-                tool="browser.search",
                 session_id=session_id,
-                input_data={"query": plan["search_query"], "engine": "yandex", "limit": 5},
+                plan=plan,
+                result=result,
             )
-            if search_resp and isinstance(search_resp, dict):
-                session_id = search_resp.get("session_id") or session_id
-
-        extract_product_resp = None
-        if plan["wants_product"]:
-            extract_product_resp = self._call_tool(
-                trace=trace,
-                trace_id=trace_id,
-                tool="browser.extract",
-                session_id=session_id,
-                input_data={
-                    "schema": {
-                        "type": "product",
-                        "fields": ["title", "price", "currency", "url"],
-                    },
-                    "mode": "dom_first",
-                    "limit": 5,
-                },
-            )
-        product_items = (
-            extract_product_resp.get("output", {}).get("items", [])
-            if isinstance(extract_product_resp, dict)
-            else []
-        )
-        if isinstance(product_items, list) and product_items:
-            first = product_items[0] if isinstance(product_items[0], dict) else {}
-            result.product = self._normalize_product(first)
-
-        extract_news_resp = None
-        if plan["wants_news"]:
-            extract_news_resp = self._call_tool(
-                trace=trace,
-                trace_id=trace_id,
-                tool="browser.extract",
-                session_id=session_id,
-                input_data={
-                    "schema": {
-                        "type": "news",
-                        "fields": ["title", "summary", "published_at", "url", "source"],
-                    },
-                    "mode": "dom_first",
-                    "limit": 5,
-                },
-            )
-        news_items = (
-            extract_news_resp.get("output", {}).get("items", [])
-            if isinstance(extract_news_resp, dict)
-            else []
-        )
-        result.news = self._normalize_news(news_items)
-
-        search_sources: list[str] = []
-        if isinstance(search_resp, dict):
-            results = search_resp.get("output", {}).get("results", [])
-            search_sources = self._normalize_sources(results)
-
-        news_sources = [item.url for item in result.news if item.url.strip()]
-        product_sources = [result.product.url] if self._has_product_data(result.product) and result.product is not None else []
-        result.sources = self._merge_sources(product_sources, news_sources, search_sources)
+            if informational_error is not None:
+                task_error = informational_error
 
         if req.allow_social_actions and supports_browser_action and plan["wants_message"]:
             status, session_id, task_error = self._prepare_message_action(
@@ -2598,77 +2717,34 @@ class TaskStore:
                 self._tasks[task_id] = task
             return task
 
-        search_resp = None
+        if self._should_prefer_llm_only_informational_answer(plan, req.query):
+            self._append_trace(trace, "informational_llm_only", "ok", "llm.answer")
+            assistant_text = self._answer_general_query(req.query, trace)
+            task.status = "done"
+            task.result = result
+            task.error = None
+            task.trace = trace
+            if conversation_id is not None:
+                self._set_assistant_message_for_task(
+                    conversation_id,
+                    task.task_id,
+                    assistant_text,
+                )
+            with self._lock:
+                self._tasks[task_id] = task
+            return task
+
         if has_search_work:
-            session_id, search_open_err = self._open_search_page(trace, trace_id, session_id, plan["search_query"])
-            if search_open_err is not None and task_error is None:
-                task_error = self._humanize_tool_error("browser.open", search_open_err, req.query)
-            search_resp = self._call_tool(
+            session_id, informational_error = self._run_informational_retrieval(
+                query=req.query,
                 trace=trace,
                 trace_id=trace_id,
-                tool="browser.search",
                 session_id=session_id,
-                input_data={"query": plan["search_query"], "engine": "yandex", "limit": 5},
+                plan=plan,
+                result=result,
             )
-            if search_resp and isinstance(search_resp, dict):
-                session_id = search_resp.get("session_id") or session_id
-
-        extract_product_resp = None
-        if plan["wants_product"]:
-            extract_product_resp = self._call_tool(
-                trace=trace,
-                trace_id=trace_id,
-                tool="browser.extract",
-                session_id=session_id,
-                input_data={
-                    "schema": {
-                        "type": "product",
-                        "fields": ["title", "price", "currency", "url"],
-                    },
-                    "mode": "dom_first",
-                    "limit": 5,
-                },
-            )
-        product_items = (
-            extract_product_resp.get("output", {}).get("items", [])
-            if isinstance(extract_product_resp, dict)
-            else []
-        )
-        if isinstance(product_items, list) and product_items:
-            first = product_items[0] if isinstance(product_items[0], dict) else {}
-            result.product = self._normalize_product(first)
-
-        extract_news_resp = None
-        if plan["wants_news"]:
-            extract_news_resp = self._call_tool(
-                trace=trace,
-                trace_id=trace_id,
-                tool="browser.extract",
-                session_id=session_id,
-                input_data={
-                    "schema": {
-                        "type": "news",
-                        "fields": ["title", "summary", "published_at", "url", "source"],
-                    },
-                    "mode": "dom_first",
-                    "limit": 5,
-                },
-            )
-        news_items = (
-            extract_news_resp.get("output", {}).get("items", [])
-            if isinstance(extract_news_resp, dict)
-            else []
-        )
-        result.news = self._normalize_news(news_items)
-
-        search_sources: list[str] = []
-        if isinstance(search_resp, dict):
-            results = search_resp.get("output", {}).get("results", [])
-            search_sources = self._normalize_sources(results)
-
-        news_sources = [item.url for item in result.news if item.url.strip()]
-        product_sources = [result.product.url] if self._has_product_data(result.product) and result.product is not None else []
-        result.sources = self._merge_sources(product_sources, news_sources, search_sources)
+            if informational_error is not None and task_error is None:
+                task_error = informational_error
 
         if req.allow_social_actions and supports_browser_action and plan["wants_message"]:
             status, session_id, task_error = self._prepare_message_action(

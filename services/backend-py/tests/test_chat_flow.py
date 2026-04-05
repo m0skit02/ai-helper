@@ -190,7 +190,20 @@ class FakeToolsClientMessageAuthRequired(FakeToolsClientMessageOnly):
             raise ToolsClientError(
                 "auth_required",
                 "Я не могу это сделать, пока вы не авторизуетесь на сайте vk.com.",
-            )
+        )
+        return super().call_tool(tool=tool, session_id=session_id, input_data=input_data, trace_id=trace_id)
+
+
+class FakeToolsClientInformationalNoOpen(FakeToolsClient):
+    def call_tool(
+        self,
+        tool: str,
+        session_id: str | None,
+        input_data: dict[str, Any],
+        trace_id: str,
+    ) -> dict[str, Any]:
+        if tool == "browser.open":
+            raise AssertionError("browser.open should not be called for pure informational news flow")
         return super().call_tool(tool=tool, session_id=session_id, input_data=input_data, trace_id=trace_id)
 
 
@@ -440,3 +453,44 @@ def test_message_only_request_skips_search_and_sources(client: TestClient) -> No
     assert data["status"] == "needs_confirmation"
     assert data["result"]["sources"] == []
     assert [item["step"] for item in data["trace"] if "browser.search" in item["step"]] == []
+
+
+def test_informational_news_flow_skips_browser_open_when_search_succeeds(client: TestClient) -> None:
+    store.reset_for_tests(tools_client=FakeToolsClientInformationalNoOpen(), llm_client=None)
+
+    resp = client.post(
+        "/task",
+        json={"query": "10 последних новостей по Apple за 10 дней", "allow_social_actions": True},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "done"
+    assert data["error"] is None
+    assert data["result"]["news"]
+    assert [item for item in data["trace"] if item["step"] == "informational_flow"]
+    assert [item for item in data["trace"] if "browser.open" in item["step"]] == []
+
+
+def test_news_prompt_uses_llm_only_without_browser_actions_in_chat(client: TestClient) -> None:
+    store.reset_for_tests(tools_client=FakeToolsClientInformationalNoOpen(), llm_client=FakeLLMClientGeneralAnswer())
+
+    conv = client.post("/chat/conversations", json={"title": "News"}).json()
+    cid = conv["conversation_id"]
+
+    created = client.post(
+        f"/chat/conversations/{cid}/messages",
+        json={"content": "Новости про электромобили", "allow_social_actions": True},
+    )
+    assert created.status_code == 200
+
+    task = wait_for_task(client, created.json()["task"]["task_id"])
+    assert task["status"] == "done"
+    assert task["error"] is None
+    assert [item for item in task["trace"] if item["step"] == "informational_llm_only"]
+    assert [item for item in task["trace"] if "browser.open" in item["step"]] == []
+    assert [item for item in task["trace"] if "browser.search" in item["step"]] == []
+
+    messages = client.get(f"/chat/conversations/{cid}/messages").json()["items"]
+    assistant_message = [m for m in messages if m["role"] == "assistant" and m["task_id"] == task["task_id"]][0]["content"]
+    assert "профицит калорий" in assistant_message.lower()
