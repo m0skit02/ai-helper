@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.llm_client import LLMClientError
 from app.main import app, store
+from app.store import extract_message_destination
 from app.tools_client import ToolsClientError
 
 
@@ -19,6 +20,21 @@ class FakeToolsClient:
         input_data: dict[str, Any],
         trace_id: str,
     ) -> dict[str, Any]:
+        if tool == "browser.open":
+            return {
+                "trace_id": trace_id,
+                "session_id": session_id or "sess-1",
+                "tool": tool,
+                "ok": True,
+                "output": {
+                    "opened": True,
+                    "url": input_data.get("url", ""),
+                    "tab_id": 1,
+                },
+                "error": None,
+                "duration_ms": 10,
+            }
+
         if tool == "browser.search":
             return {
                 "trace_id": trace_id,
@@ -162,6 +178,22 @@ class FakeToolsClientMessageOnly(FakeToolsClient):
         return super().call_tool(tool=tool, session_id=session_id, input_data=input_data, trace_id=trace_id)
 
 
+class FakeToolsClientMessageAuthRequired(FakeToolsClientMessageOnly):
+    def call_tool(
+        self,
+        tool: str,
+        session_id: str | None,
+        input_data: dict[str, Any],
+        trace_id: str,
+    ) -> dict[str, Any]:
+        if tool == "browser.message.draft":
+            raise ToolsClientError(
+                "auth_required",
+                "Я не могу это сделать, пока вы не авторизуетесь на сайте vk.com.",
+            )
+        return super().call_tool(tool=tool, session_id=session_id, input_data=input_data, trace_id=trace_id)
+
+
 @pytest.fixture()
 def client() -> TestClient:
     store.reset_for_tests(tools_client=FakeToolsClient())
@@ -247,6 +279,64 @@ def test_confirm_reject_updates_assistant_message(client: TestClient) -> None:
     messages = client.get(f"/chat/conversations/{cid}/messages").json()["items"]
     assistant = [m for m in messages if m["role"] == "assistant" and m["task_id"] == task["task_id"]][0]
     assert "отменено пользователем" in assistant["content"].lower()
+
+
+def test_message_request_uses_deterministic_flow_without_llm(client: TestClient) -> None:
+    store.reset_for_tests(tools_client=FakeToolsClientMessageOnly(), llm_client=None)
+
+    conv = client.post("/chat/conversations", json={"title": "VK"}).json()
+    cid = conv["conversation_id"]
+
+    created = client.post(
+        f"/chat/conversations/{cid}/messages",
+        json={"content": "Отправь сообщение Сергею во ВКонтакте: Привет, как дела?", "allow_social_actions": True},
+    )
+    assert created.status_code == 200
+
+    task = wait_for_task(client, created.json()["task"]["task_id"])
+    assert task["status"] == "needs_confirmation"
+    assert task["result"]["actions"]
+    payload = task["result"]["actions"][0]["payload"]
+    assert payload["destination_hint"]
+    assert payload["message_text"] == "Привет, как дела?"
+    assert payload["site_url"] == "https://vk.com/im"
+
+    messages = client.get(f"/chat/conversations/{cid}/messages").json()["items"]
+    assistant = [m for m in messages if m["role"] == "assistant" and m["task_id"] == task["task_id"]][0]
+    assert "подтвердите отправку" in assistant["content"].lower()
+
+
+def test_message_request_surfaces_clear_auth_required_message(client: TestClient) -> None:
+    store.reset_for_tests(tools_client=FakeToolsClientMessageAuthRequired(), llm_client=None)
+
+    conv = client.post("/chat/conversations", json={"title": "VK Auth"}).json()
+    cid = conv["conversation_id"]
+
+    created = client.post(
+        f"/chat/conversations/{cid}/messages",
+        json={"content": "Отправь сообщение Сергею во ВКонтакте: Привет", "allow_social_actions": True},
+    )
+    assert created.status_code == 200
+
+    task = wait_for_task(client, created.json()["task"]["task_id"])
+    assert task["status"] == "failed"
+    assert "авторизуетесь" in (task["error"] or "").lower()
+    assert "vk.com" in (task["error"] or "").lower()
+
+    messages = client.get(f"/chat/conversations/{cid}/messages").json()["items"]
+    assistant = [m for m in messages if m["role"] == "assistant" and m["task_id"] == task["task_id"]][0]
+    assert "авторизуетесь" in assistant["content"].lower()
+    assert "vk.com" in assistant["content"].lower()
+
+
+def test_extract_message_destination_handles_vk_before_recipient() -> None:
+    destination = extract_message_destination('Отправь сообщение в ВКонтакте Павлу Борисову "Привет"')
+    assert destination == "Павлу Борисову"
+
+
+def test_extract_message_destination_handles_vk_after_recipient() -> None:
+    destination = extract_message_destination('Отправь сообщение Павлу Борисову во ВКонтакте: Привет')
+    assert destination == "Павлу Борисову"
 
 
 def test_rule_plan_trace_for_supported_request(client: TestClient) -> None:

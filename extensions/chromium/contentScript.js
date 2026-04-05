@@ -272,15 +272,17 @@ async function handleBrowserMessageDraft(input) {
     }
 
     const diagnostics = [];
-    const searchInput = window.location.hostname.includes("vk.com")
-        ? findVkMessengerSearchInput()
-        : findFirstVisible([
-            "input[type='search']",
-            "input[placeholder*='Поиск' i]",
-            "input[placeholder*='Search' i]",
-            "input[aria-label*='Поиск' i]",
-            "input[aria-label*='Search' i]",
-        ]);
+    if (window.location.hostname.includes("vk.com")) {
+        return handleVkMessageDraft(target, messageText, diagnostics);
+    }
+
+    const searchInput = findFirstVisible([
+        "input[type='search']",
+        "input[placeholder*='Поиск' i]",
+        "input[placeholder*='Search' i]",
+        "input[aria-label*='Поиск' i]",
+        "input[aria-label*='Search' i]",
+    ]);
 
     if (searchInput) {
         focusAndReplace(searchInput, target);
@@ -288,35 +290,6 @@ async function handleBrowserMessageDraft(input) {
         await wait(500);
     } else {
         diagnostics.push("Поисковое поле не найдено, ищу адресата по тексту.");
-    }
-
-    if (window.location.hostname.includes("vk.com") && searchInput) {
-        const vkActivation = await tryActivateVkSearchResult(target, searchInput, diagnostics);
-        if (vkActivation?.opened) {
-            const editorAfterVkActivation = await waitForMessageEditor(10, 350);
-            if (editorAfterVkActivation) {
-                focusAndReplace(editorAfterVkActivation, messageText);
-                diagnostics.push(`Сообщение подготовлено в ${describeElement(editorAfterVkActivation)}.`);
-
-                const actionId = crypto.randomUUID();
-                draftedActions.set(actionId, {
-                    target,
-                    messageText,
-                    createdAt: Date.now(),
-                    editorDescriptor: describeElement(editorAfterVkActivation),
-                });
-
-                return {
-                    draft_ready: true,
-                    action_id: actionId,
-                    preview: {
-                        target,
-                        message_text: messageText,
-                    },
-                    diagnostics,
-                };
-            }
-        }
     }
 
     const destinationNode = findElementByText(target);
@@ -358,13 +331,65 @@ async function handleBrowserMessageDraft(input) {
 
     focusAndReplace(editor, messageText);
     diagnostics.push(`Сообщение подготовлено в ${describeElement(editor)}.`);
+    return buildDraftResult(target, messageText, editor, diagnostics);
+}
 
+async function handleVkMessageDraft(target, messageText, diagnostics) {
+    const searchInput = await waitForVkMessengerSearchInput(10, 250);
+    if (!searchInput) {
+        throw createToolError("ELEMENT_NOT_FOUND", "Не удалось найти поиск по чатам VK.", true, {
+            diagnostics,
+            searchCandidates: collectElementDiagnostics("input, textarea, [role='textbox']", 12),
+            pageState: captureVkChatState(),
+        });
+    }
+
+    const lookupQueries = buildVkLookupQueries(target);
+    const searchQuery = lookupQueries[0] || target;
+    focusAndReplace(searchInput, searchQuery);
+    diagnostics.push(
+        searchQuery === target
+            ? `VK: заполнен поиск по чатам (${describeElement(searchInput)}).`
+            : `VK: поиск по чатам скорректирован до "${searchQuery}" (${describeElement(searchInput)}).`
+    );
+    await wait(350);
+
+    const activation = await tryActivateVkSearchResult(target, searchInput, diagnostics, lookupQueries);
+    if (!activation?.opened) {
+        throw createToolError("ELEMENT_NOT_FOUND", `Не удалось открыть чат "${target}" в VK.`, true, {
+            diagnostics,
+            candidates: collectVkTopCandidateDiagnostics(lookupQueries, searchInput, 8),
+            pageState: captureVkChatState(),
+        });
+    }
+
+    const editor = await waitForMessageEditor(10, 350);
+    if (!editor) {
+        throw createToolError("ELEMENT_NOT_FOUND", "VK открыл чат, но поле ввода сообщения не найдено.", true, {
+            diagnostics,
+            editorCandidates: collectElementDiagnostics(
+                "[contenteditable='true'], [role='textbox'], textarea, input[type='text'], input[type='search']",
+                12
+            ),
+            pageState: captureVkChatState(),
+        });
+    }
+
+    focusAndReplace(editor, messageText);
+    diagnostics.push(`VK: сообщение подготовлено в ${describeElement(editor)}.`);
+    return buildDraftResult(target, messageText, editor, diagnostics, {
+        selected_chat: activation.selectedChat || null,
+    });
+}
+
+function buildDraftResult(target, messageText, editor, diagnostics, extras = {}) {
     const actionId = crypto.randomUUID();
     draftedActions.set(actionId, {
         target,
         messageText,
         createdAt: Date.now(),
         editorDescriptor: describeElement(editor),
+        ...extras,
     });
 
     return {
@@ -375,6 +400,7 @@ async function handleBrowserMessageDraft(input) {
             message_text: messageText,
         },
         diagnostics,
+        ...extras,
     };
 }
 
@@ -400,11 +426,12 @@ async function handleBrowserMessageSend(input) {
         throw createToolError("ELEMENT_NOT_FOUND", "Поле ввода больше недоступно.", true);
     }
 
-    const sendButton = findButtonByText(["Отправить", "Send", "Отослать"]);
-    if (sendButton) {
-        sendButton.click();
-    } else {
-        dispatchEnter(editor);
+    const sendResult = await attemptMessageSend(editor, draft);
+    if (!sendResult.sent) {
+        throw createToolError("ELEMENT_NOT_FOUND", sendResult.message, true, {
+            diagnostics: sendResult.diagnostics,
+            pageState: window.location.hostname.includes("vk.com") ? captureVkChatState() : capturePageState(),
+        });
     }
 
     draftedActions.delete(actionId);
@@ -412,11 +439,193 @@ async function handleBrowserMessageSend(input) {
     return {
         action_id: actionId,
         status: "sent",
+        method: sendResult.method,
         preview: {
             target: draft.target,
             message_text: draft.messageText,
         },
     };
+}
+
+async function attemptMessageSend(editor, draft) {
+    const diagnostics = [];
+    const beforeText = readEditorValue(editor);
+
+    const button = findSendButton(editor);
+    if (button) {
+        activateElement(button);
+        diagnostics.push(`Отправка через кнопку ${describeElement(button)}.`);
+        if (await waitForMessageSendEffect(editor, beforeText, draft.messageText, 1200)) {
+            return { sent: true, method: "button", diagnostics };
+        }
+        diagnostics.push("Кнопка была нажата, но редактор не изменился.");
+    } else {
+        diagnostics.push("Кнопка отправки не найдена, пробую клавиатурные сценарии.");
+    }
+
+    for (const strategy of buildSendKeyStrategies()) {
+        dispatchKeyStroke(editor, strategy);
+        diagnostics.push(`Пробую отправку клавишами: ${describeKeyStrategy(strategy)}.`);
+        if (await waitForMessageSendEffect(editor, beforeText, draft.messageText, 900)) {
+            return { sent: true, method: describeKeyStrategy(strategy), diagnostics };
+        }
+    }
+
+    return {
+        sent: false,
+        method: "",
+        message: "Сообщение подготовлено, но я не смог активировать отправку.",
+        diagnostics,
+    };
+}
+
+function findSendButton(editor) {
+    if (window.location.hostname.includes("vk.com")) {
+        const vkButton = findVkSendButton(editor);
+        if (vkButton) {
+            return vkButton;
+        }
+    }
+
+    const attributeSelectors = [
+        "button[aria-label*='Отправ' i]",
+        "button[title*='Отправ' i]",
+        "button[aria-label*='Send' i]",
+        "button[title*='Send' i]",
+        "[role='button'][aria-label*='Отправ' i]",
+        "[role='button'][title*='Отправ' i]",
+        "[role='button'][aria-label*='Send' i]",
+        "[role='button'][title*='Send' i]",
+        "button[data-testid*='send' i]",
+        "[role='button'][data-testid*='send' i]",
+        "button[class*='send' i]",
+        "[role='button'][class*='send' i]",
+    ];
+
+    for (const selector of attributeSelectors) {
+        const match = Array.from(document.querySelectorAll(selector)).find((element) => isVisible(element));
+        if (match) {
+            return match;
+        }
+    }
+
+    return findButtonByText(["Отправить", "Send", "Отослать"], { exact: false });
+}
+
+function findVkSendButton(editor) {
+    const container = editor.closest("form, footer, [class*='composer'], [class*='im-chat-input'], [class*='Input']");
+    const selectors = [
+        "button[aria-label*='Отправ' i]",
+        "button[title*='Отправ' i]",
+        "[role='button'][aria-label*='Отправ' i]",
+        "[role='button'][title*='Отправ' i]",
+        "button[class*='send' i]",
+        "[role='button'][class*='send' i]",
+        "button",
+        "[role='button']",
+    ];
+
+    if (container) {
+        for (const selector of selectors) {
+            const candidates = Array.from(container.querySelectorAll(selector))
+                .filter((element) => isVisible(element))
+                .sort((left, right) => scoreSendButtonCandidate(right) - scoreSendButtonCandidate(left));
+            if (candidates.length && scoreSendButtonCandidate(candidates[0]) > 0) {
+                return candidates[0];
+            }
+        }
+    }
+
+    const globalCandidates = Array.from(document.querySelectorAll("button, [role='button']"))
+        .filter((element) => isVisible(element))
+        .sort((left, right) => scoreSendButtonCandidate(right) - scoreSendButtonCandidate(left));
+    return globalCandidates.length && scoreSendButtonCandidate(globalCandidates[0]) > 0 ? globalCandidates[0] : null;
+}
+
+function scoreSendButtonCandidate(element) {
+    const text = normalizeText(
+        [
+            element.innerText,
+            element.getAttribute("aria-label"),
+            element.getAttribute("title"),
+            element.getAttribute("data-testid"),
+            element.className,
+        ].filter(Boolean).join(" ")
+    ).toLowerCase();
+
+    let score = 0;
+    if (text.includes("отправ")) {
+        score += 80;
+    }
+    if (text.includes("send")) {
+        score += 70;
+    }
+    if (text.includes("submit")) {
+        score += 30;
+    }
+    if (text.includes("voice") || text.includes("microphone") || text.includes("emoji") || text.includes("стикер")) {
+        score -= 120;
+    }
+    if (element.tagName.toLowerCase() === "button") {
+        score += 10;
+    }
+    return score;
+}
+
+function buildSendKeyStrategies() {
+    return [
+        { key: "Enter" },
+        { key: "Enter", ctrlKey: true },
+        { key: "Enter", metaKey: true },
+    ];
+}
+
+function describeKeyStrategy(strategy) {
+    const modifiers = [];
+    if (strategy.ctrlKey) {
+        modifiers.push("Ctrl");
+    }
+    if (strategy.metaKey) {
+        modifiers.push("Meta");
+    }
+    modifiers.push(strategy.key);
+    return modifiers.join("+");
+}
+
+function dispatchKeyStroke(element, strategy) {
+    dispatchKey(element, strategy.key, strategy);
+}
+
+async function waitForMessageSendEffect(editor, beforeText, expectedText, timeoutMs) {
+    const startedAt = Date.now();
+    const normalizedBefore = normalizeLookupText(beforeText || expectedText || "");
+
+    while (Date.now() - startedAt < timeoutMs) {
+        const currentText = normalizeLookupText(readEditorValue(editor));
+        if (!currentText) {
+            return true;
+        }
+        if (normalizedBefore && currentText !== normalizedBefore) {
+            return true;
+        }
+
+        await wait(120);
+    }
+
+    return false;
+}
+
+function readEditorValue(element) {
+    if (!element) {
+        return "";
+    }
+    if (isTextInput(element)) {
+        return element.value || "";
+    }
+    if (element.isContentEditable) {
+        return element.textContent || "";
+    }
+    return element.innerText || "";
 }
 
 function inspectPage() {
@@ -448,9 +657,17 @@ function detectAuthRequired() {
         };
     }
 
+    const authFormField = findFirstVisible([
+        "input[name*='email' i]",
+        "input[name*='login' i]",
+        "input[name*='phone' i]",
+        "input[autocomplete='username']",
+        "input[autocomplete='email']",
+        "input[autocomplete='tel']",
+    ]);
     const loginButton = findButtonByText(["Войти", "Вход", "Log in", "Login", "Sign in"]);
     const loginLink = findLinkByText(["Войти", "Вход", "Log in", "Login", "Sign in"]);
-    if (loginButton || loginLink) {
+    if ((loginButton || loginLink) && authFormField) {
         return {
             required: true,
             message: `Я не могу это сделать, пока вы не авторизуетесь на сайте ${window.location.hostname}.`,
@@ -706,6 +923,19 @@ async function waitForMessageEditor(attempts, delayMs) {
     return null;
 }
 
+async function waitForVkMessengerSearchInput(attempts, delayMs) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const searchInput = findVkMessengerSearchInput();
+        if (searchInput) {
+            return searchInput;
+        }
+
+        await wait(delayMs);
+    }
+
+    return null;
+}
+
 function findMessageEditor() {
     if (window.location.hostname.includes("vk.com")) {
         const vkEditor = findVkMessageEditor();
@@ -774,59 +1004,440 @@ function findVkMessageEditor() {
     return null;
 }
 
-async function tryActivateVkSearchResult(target, searchInput, diagnostics) {
-    const beforeState = capturePageState();
-    const resultNode =
-        findVkPrimarySearchResultButton(target, searchInput) ||
-        findVkSearchResult(target, searchInput) ||
-        findVkConversationRow(target, searchInput);
+async function tryActivateVkSearchResult(target, searchInput, diagnostics, lookupQueries = buildVkLookupQueries(target)) {
+    const beforeState = captureVkChatState();
+    const resultNode = await findBestVkChatCandidateWithRetry(lookupQueries, searchInput, 7, 250);
 
-    if (resultNode) {
-        const clickable = getClickableTarget(resultNode);
-        activateElement(clickable);
-        await wait(350);
-        diagnostics.push(`VK-результат поиска найден и активирован (${describeElement(clickable)}).`);
-    } else {
+    if (!resultNode) {
         diagnostics.push("VK-результат внутри списка диалогов не найден.");
         return { opened: false };
     }
 
-    let navigationState = await waitForNavigationOrContentChange(beforeState, 1800);
-    if (!navigationState.changed) {
-        const selectedResult = findVkPrimarySearchResultButton(target, searchInput);
-        if (selectedResult) {
-            activateElement(selectedResult);
-            diagnostics.push(`VK fallback: повторно активирую SearchResult (${describeElement(selectedResult)}).`);
-            await wait(350);
-            navigationState = await waitForNavigationOrContentChange(beforeState, 1800);
-        }
-    }
-    if (!navigationState.changed) {
-        const popupResult = findVkPopupResult(target, searchInput);
-        if (popupResult) {
-            const popupClickable = getClickableTarget(popupResult);
-            activateElement(popupClickable);
-            diagnostics.push(`VK показал popover с результатами, активирую конкретный пункт (${describeElement(popupClickable)}).`);
-            navigationState = await waitForNavigationOrContentChange(beforeState, 2200);
-        } else {
-            diagnostics.push("VK не открыл диалог после первичной активации.");
+    const candidateText = normalizeText(resultNode.innerText || resultNode.getAttribute("aria-label") || "");
+    const clickable = getClickableTarget(resultNode);
+    activateElement(clickable);
+    diagnostics.push(`VK: выбран кандидат "${candidateText || target}" (${describeElement(clickable)}).`);
+
+    let activationState = await waitForVkChatOpen(lookupQueries, beforeState, 2600);
+    if (!activationState.opened) {
+        const fallbackUrl = resolveVkChatHref(resultNode);
+        if (fallbackUrl) {
+            diagnostics.push(`VK fallback: открываю диалог по ссылке ${fallbackUrl}.`);
+            window.location.href = fallbackUrl;
+            await waitForPageToSettle();
+            activationState = await waitForVkChatOpen(lookupQueries, beforeState, 2600);
         }
     }
 
-    if (navigationState.changed) {
+    if (activationState.opened) {
         diagnostics.push(
-            navigationState.urlChanged
-                ? `VK после выбора результата изменил URL: ${navigationState.fromUrl} -> ${navigationState.toUrl}.`
-                : "VK после выбора результата обновил DOM."
+            activationState.state.url !== beforeState.url
+                ? `VK открыл диалог: ${beforeState.url} -> ${activationState.state.url}.`
+                : "VK открыл нужный диалог без смены URL."
         );
         await waitForPageToSettle();
     } else {
-        diagnostics.push("VK после активации результата не показал явной навигации.");
+        diagnostics.push("VK не подтвердил открытие нужного диалога после выбора результата.");
     }
 
     return {
-        opened: navigationState.changed,
+        opened: activationState.opened,
+        selectedChat: activationState.state.chatTitle || activationState.state.selectedChatText || candidateText || target,
     };
+}
+
+async function findBestVkChatCandidateWithRetry(target, searchInput, attempts, delayMs) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const candidate = findBestVkChatCandidate(target, searchInput);
+        if (candidate) {
+            return candidate;
+        }
+
+        await wait(delayMs);
+    }
+
+    return null;
+}
+
+function findBestVkChatCandidate(target, searchInput) {
+    const scope = getVkSearchResultsScope(searchInput);
+    const candidates = collectVkChatCandidates(scope)
+        .map((element) => ({
+            element,
+            score: scoreVkChatCandidate(element, target),
+        }))
+        .filter((item) => item.score >= 60)
+        .sort((left, right) => right.score - left.score);
+
+    return candidates[0]?.element || null;
+}
+
+function collectVkTopCandidateDiagnostics(target, searchInput, limit) {
+    const scope = getVkSearchResultsScope(searchInput);
+    return collectVkChatCandidates(scope)
+        .map((element) => ({
+            score: scoreVkChatCandidate(element, target),
+            element: describeDiagnosticElement(element),
+        }))
+        .sort((left, right) => right.score - left.score)
+        .slice(0, limit);
+}
+
+function collectVkChatCandidates(scope) {
+    const root = scope || document.body;
+    const selectors = [
+        "button.SearchResult",
+        "[class*='SearchResult']",
+        "a[href*='sel=']",
+        "a[href*='/im?']",
+        "[role='option']",
+        "[role='menuitem']",
+        "[aria-selected='true']",
+        "[class*='ConvoList__item']",
+        ".VirtualScrollItem",
+        "[class*='conversation-item']",
+        "[class*='dialog-item']",
+        "[class*='Chat'] a",
+        "[class*='Convo'] a",
+        "[class*='Search'] [tabindex]",
+        "li",
+    ];
+    const seen = new Set();
+    const items = [];
+
+    for (const selector of selectors) {
+        for (const element of root.querySelectorAll(selector)) {
+            if (!isVisible(element) || !isReasonableVkCandidate(element)) {
+                continue;
+            }
+
+            const text = normalizeText(element.innerText || element.getAttribute("aria-label") || "");
+            if (!text) {
+                continue;
+            }
+
+            const href = element.getAttribute("href") || element.querySelector("a[href]")?.getAttribute("href") || "";
+            const key = `${element.tagName}|${href}|${text.slice(0, 120)}`;
+            if (seen.has(key)) {
+                continue;
+            }
+
+            seen.add(key);
+            items.push(element);
+        }
+    }
+
+    return items;
+}
+
+function scoreVkChatCandidate(element, target) {
+    const lookupQueries = coerceLookupQueries(target);
+    const text = normalizeLookupText(element.innerText || element.getAttribute("aria-label") || "");
+    if (!text || !lookupQueries.length) {
+        return -1000;
+    }
+
+    const textTokens = tokenizeLookup(text);
+    const href = element.getAttribute("href") || element.querySelector("a[href]")?.getAttribute("href") || "";
+    const className = String(element.className || "").toLowerCase();
+    let score = -500;
+
+    for (const query of lookupQueries) {
+        const targetText = normalizeLookupText(query);
+        if (!targetText) {
+            continue;
+        }
+
+        const targetTokens = tokenizeLookup(targetText);
+        const matchedTokens = targetTokens.filter((token) => textTokens.includes(token) || text.includes(token));
+        if (!matchedTokens.length) {
+            continue;
+        }
+
+        let variantScore = matchedTokens.length * 25;
+        if (matchedTokens.length === targetTokens.length) {
+            variantScore += 80;
+        }
+        if (text === targetText) {
+            variantScore += 140;
+        } else if (text.startsWith(targetText)) {
+            variantScore += 90;
+        } else if (text.includes(targetText)) {
+            variantScore += 65;
+        }
+        variantScore -= Math.max(0, text.length - targetText.length);
+        score = Math.max(score, variantScore);
+    }
+
+    if (href.includes("sel=") || href.includes("/im?")) {
+        score += 30;
+    }
+    if (element.tagName.toLowerCase() === "button" || element.tagName.toLowerCase() === "a") {
+        score += 10;
+    }
+    if (element.getAttribute("role") === "option" || element.getAttribute("role") === "menuitem") {
+        score += 10;
+    }
+    if (element.getAttribute("aria-selected") === "true" || className.includes("selected")) {
+        score += 8;
+    }
+    if (className.includes("searchresult")) {
+        score += 8;
+    }
+    if (text.includes("глобальный поиск") || text.includes("global search")) {
+        score -= 120;
+    }
+    if (text === "чаты сообщения каналы") {
+        score -= 150;
+    }
+
+    return score;
+}
+
+function coerceLookupQueries(target) {
+    if (Array.isArray(target)) {
+        return target
+            .map((item) => normalizeText(item))
+            .filter(Boolean);
+    }
+
+    const single = normalizeText(target);
+    return single ? [single] : [];
+}
+
+function buildVkLookupQueries(target) {
+    const original = normalizeText(target);
+    if (!original) {
+        return [];
+    }
+
+    const corrected = normalizeRussianPersonTarget(original);
+    const variants = corrected && corrected.toLowerCase() !== original.toLowerCase()
+        ? [corrected, original]
+        : [original];
+
+    return Array.from(new Set(variants));
+}
+
+function normalizeRussianPersonTarget(target) {
+    const tokens = normalizeText(target).split(/\s+/).filter(Boolean);
+    if (!tokens.length) {
+        return "";
+    }
+
+    const normalizedTokens = tokens.map((token, index) =>
+        normalizeRussianPersonToken(token, {
+            isFirst: index === 0,
+            isLast: index === tokens.length - 1,
+        })
+    );
+    return normalizedTokens.join(" ");
+}
+
+function normalizeRussianPersonToken(token, position = {}) {
+    const lower = token.toLowerCase();
+    const specialMap = {
+        "алексею": "Алексей",
+        "андрею": "Андрей",
+        "артему": "Артем",
+        "артёму": "Артём",
+        "василию": "Василий",
+        "виктору": "Виктор",
+        "евгению": "Евгений",
+        "егору": "Егор",
+        "ивану": "Иван",
+        "игорю": "Игорь",
+        "илье": "Илья",
+        "максиму": "Максим",
+        "матвею": "Матвей",
+        "михаилу": "Михаил",
+        "николаю": "Николай",
+        "павлу": "Павел",
+        "роману": "Роман",
+        "сергею": "Сергей",
+        "тимофею": "Тимофей",
+        "юрию": "Юрий",
+    };
+    if (specialMap[lower]) {
+        return matchTokenCase(token, specialMap[lower]);
+    }
+
+    const surnameRules = [
+        [/ову$/i, "ов"],
+        [/еву$/i, "ев"],
+        [/ёву$/i, "ёв"],
+        [/ину$/i, "ин"],
+        [/ыну$/i, "ын"],
+    ];
+    for (const [pattern, replacement] of surnameRules) {
+        if (pattern.test(token)) {
+            return token.replace(pattern, replacement);
+        }
+    }
+
+    const endingRules = [
+        [/ею$/i, "ей"],
+        [/ию$/i, "ий"],
+        [/аю$/i, "ай"],
+    ];
+    for (const [pattern, replacement] of endingRules) {
+        if (pattern.test(token)) {
+            return token.replace(pattern, replacement);
+        }
+    }
+
+    if (position.isFirst && /[бвгджзйклмнпрстфхцчшщ]у$/i.test(token) && token.length >= 4) {
+        return token.slice(0, -1);
+    }
+
+    return token;
+}
+
+function matchTokenCase(source, target) {
+    if (!source) {
+        return target;
+    }
+    if (source === source.toUpperCase()) {
+        return target.toUpperCase();
+    }
+    if (source[0] === source[0].toUpperCase()) {
+        return target[0].toUpperCase() + target.slice(1);
+    }
+    return target.toLowerCase();
+}
+
+function normalizeLookupText(value) {
+    return String(value || "")
+        .toLowerCase()
+        .replace(/@id\d+/g, " ")
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function tokenizeLookup(value) {
+    return normalizeLookupText(value)
+        .split(" ")
+        .filter((token) => token.length >= 2);
+}
+
+function resolveVkChatHref(element) {
+    const href = element.getAttribute("href") || element.querySelector("a[href]")?.getAttribute("href") || "";
+    if (!href) {
+        return "";
+    }
+
+    try {
+        return new URL(href, window.location.href).toString();
+    } catch (_error) {
+        return "";
+    }
+}
+
+function captureVkChatState() {
+    const editor = findVkMessageEditor();
+    return {
+        url: window.location.href,
+        chatTitle: findVkActiveChatTitle(),
+        selectedChatText: findVkSelectedChatText(),
+        editorVisible: Boolean(editor),
+    };
+}
+
+async function waitForVkChatOpen(target, beforeState, timeoutMs) {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeoutMs) {
+        const state = captureVkChatState();
+        if (isVkChatStateMatch(state, target, beforeState)) {
+            return {
+                opened: true,
+                state,
+            };
+        }
+
+        await wait(150);
+    }
+
+    return {
+        opened: false,
+        state: captureVkChatState(),
+    };
+}
+
+function isVkChatStateMatch(state, target, beforeState) {
+    const lookupQueries = coerceLookupQueries(target);
+    if (state.chatTitle && lookupQueries.some((query) => isLookupMatch(state.chatTitle, query))) {
+        return true;
+    }
+
+    if (state.selectedChatText && lookupQueries.some((query) => isLookupMatch(state.selectedChatText, query))) {
+        return true;
+    }
+
+    return state.editorVisible && state.url !== beforeState.url && state.url.includes("sel=");
+}
+
+function isLookupMatch(value, target) {
+    const valueNormalized = normalizeLookupText(value);
+    const targetNormalized = normalizeLookupText(target);
+    if (!valueNormalized || !targetNormalized) {
+        return false;
+    }
+    if (valueNormalized === targetNormalized || valueNormalized.startsWith(targetNormalized)) {
+        return true;
+    }
+
+    const valueTokens = tokenizeLookup(valueNormalized);
+    const targetTokens = tokenizeLookup(targetNormalized);
+    return targetTokens.length > 0 && targetTokens.every((token) => valueTokens.includes(token));
+}
+
+function findVkActiveChatTitle() {
+    const selectors = [
+        "header h1",
+        "header h2",
+        "[class*='PeerName']",
+        "[class*='ConversationHeader'] h1",
+        "[class*='ConversationHeader'] h2",
+        "[class*='chat-header'] h1",
+        "[class*='chat-header'] h2",
+        "[class*='Title']",
+    ];
+
+    for (const selector of selectors) {
+        for (const element of document.querySelectorAll(selector)) {
+            if (!isVisible(element)) {
+                continue;
+            }
+
+            const text = normalizeText(element.innerText);
+            if (text && text.length <= 120) {
+                return text;
+            }
+        }
+    }
+
+    return "";
+}
+
+function findVkSelectedChatText() {
+    const selectors = [
+        "[aria-selected='true']",
+        "[class*='selected']",
+        "[class*='active']",
+        ".ConvoList__item--selected",
+    ];
+
+    for (const selector of selectors) {
+        const element = Array.from(document.querySelectorAll(selector)).find((candidate) => isVisible(candidate));
+        const text = normalizeText(element?.innerText || "");
+        if (text) {
+            return text;
+        }
+    }
+
+    return "";
 }
 
 function findVkSearchResult(target, searchInput) {
@@ -1345,7 +1956,8 @@ function isGoodClickableTarget(element) {
     return false;
 }
 
-function findButtonByText(labels) {
+function findButtonByText(labels, options = {}) {
+    const exact = options.exact !== false;
     const lowerLabels = labels.map((label) => label.toLowerCase());
     const buttons = Array.from(document.querySelectorAll("button, div[role='button'], span[role='button']"));
 
@@ -1355,8 +1967,16 @@ function findButtonByText(labels) {
                 return false;
             }
 
-            const content = normalizeText(button.innerText).toLowerCase();
-            return lowerLabels.includes(content);
+            const content = normalizeText(
+                [
+                    button.innerText,
+                    button.getAttribute("aria-label"),
+                    button.getAttribute("title"),
+                ].filter(Boolean).join(" ")
+            ).toLowerCase();
+            return exact
+                ? lowerLabels.includes(content)
+                : lowerLabels.some((label) => content === label || content.includes(label));
         }) || null
     );
 }
@@ -1450,15 +2070,91 @@ function focusAndReplace(element, value) {
     element.focus();
 
     if (isTextInput(element)) {
-        element.value = value;
+        const prototype = element instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+        if (descriptor?.set) {
+            descriptor.set.call(element, value);
+        } else {
+            element.value = value;
+        }
         element.dispatchEvent(new Event("input", { bubbles: true }));
         element.dispatchEvent(new Event("change", { bubbles: true }));
         return;
     }
 
     if (element.isContentEditable) {
-        element.textContent = value;
-        element.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
+        replaceContentEditableValue(element, value);
+    }
+}
+
+function replaceContentEditableValue(element, value) {
+    const selection = window.getSelection();
+    const safeValue = String(value || "");
+
+    try {
+        selection?.removeAllRanges();
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        selection?.addRange(range);
+
+        element.dispatchEvent(
+            new InputEvent("beforeinput", {
+                bubbles: true,
+                cancelable: true,
+                data: null,
+                inputType: "deleteContentBackward",
+            })
+        );
+
+        range.deleteContents();
+        element.textContent = "";
+
+        element.dispatchEvent(
+            new InputEvent("beforeinput", {
+                bubbles: true,
+                cancelable: true,
+                data: safeValue,
+                inputType: "insertText",
+            })
+        );
+
+        let inserted = false;
+        if (typeof document.execCommand === "function") {
+            try {
+                inserted = document.execCommand("insertText", false, safeValue);
+            } catch (_error) {
+                inserted = false;
+            }
+        }
+
+        if (!inserted) {
+            const textNode = document.createTextNode(safeValue);
+            range.deleteContents();
+            range.insertNode(textNode);
+            range.setStartAfter(textNode);
+            range.collapse(true);
+            selection?.removeAllRanges();
+            selection?.addRange(range);
+        }
+
+        element.dispatchEvent(
+            new InputEvent("input", {
+                bubbles: true,
+                data: safeValue,
+                inputType: "insertText",
+            })
+        );
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+        dispatchKey(element, "End");
+        dispatchKey(element, "ArrowRight");
+        dispatchKey(element, " ", { code: "Space" });
+        dispatchKey(element, "Backspace");
+    } catch (_error) {
+        element.textContent = safeValue;
+        element.dispatchEvent(new InputEvent("input", { bubbles: true, data: safeValue, inputType: "insertText" }));
+        element.dispatchEvent(new Event("change", { bubbles: true }));
     }
 }
 
@@ -1466,21 +2162,33 @@ function dispatchEnter(element) {
     dispatchKey(element, "Enter");
 }
 
-function dispatchKey(element, key) {
-    element.dispatchEvent(
-        new KeyboardEvent("keydown", {
-            key,
-            code: key,
-            bubbles: true,
-        })
-    );
-    element.dispatchEvent(
-        new KeyboardEvent("keyup", {
-            key,
-            code: key,
-            bubbles: true,
-        })
-    );
+function dispatchKey(element, key, options = {}) {
+    const code = options.code || (key === " " ? "Space" : key);
+    const keyCodeMap = {
+        Enter: 13,
+        " ": 32,
+        Backspace: 8,
+        End: 35,
+        ArrowRight: 39,
+    };
+    const keyCode = keyCodeMap[key];
+
+    for (const eventName of ["keydown", "keypress", "keyup"]) {
+        element.dispatchEvent(
+            new KeyboardEvent(eventName, {
+                key,
+                code,
+                bubbles: true,
+                cancelable: true,
+                ctrlKey: Boolean(options.ctrlKey),
+                shiftKey: Boolean(options.shiftKey),
+                altKey: Boolean(options.altKey),
+                metaKey: Boolean(options.metaKey),
+                keyCode,
+                which: keyCode,
+            })
+        );
+    }
 }
 
 function activateElement(element) {

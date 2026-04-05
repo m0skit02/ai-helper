@@ -596,25 +596,17 @@ def extract_message_destination(query: str) -> str:
     normalized = query.strip()
     if ":" in normalized:
         normalized = normalized.split(":", 1)[0].strip()
+    else:
+        quote_pairs = [("\"", "\""), ("«", "»")]
+        for left, right in quote_pairs:
+            if left in normalized and right in normalized:
+                start = normalized.find(left)
+                end = normalized.rfind(right)
+                if 0 <= start < end:
+                    normalized = f"{normalized[:start].strip()} {normalized[end + 1 :].strip()}".strip()
+                    break
 
-    markers = (
-        "во вконтакте",
-        "вконтакте",
-        "в вк",
-        "в vk",
-        "vk",
-        "в telegram",
-        "в телеграм",
-        "в whatsapp",
-        "в gmail",
-    )
     lower = normalized.lower()
-    for marker in markers:
-        index = lower.find(marker)
-        if index > 0:
-            normalized = normalized[:index].strip()
-            lower = normalized.lower()
-            break
 
     prefixes = (
         "отправь сообщение",
@@ -627,6 +619,43 @@ def extract_message_destination(query: str) -> str:
     for prefix in prefixes:
         if lower.startswith(prefix):
             normalized = normalized[len(prefix):].strip(" :,-")
+            lower = normalized.lower()
+            break
+
+    leading_site_patterns = (
+        r"^(?:во|в)\s+вконтакте\b[\s,:-]*",
+        r"^(?:во|в)\s+вк\b[\s,:-]*",
+        r"^(?:во|в)\s+vk\b[\s,:-]*",
+        r"^(?:on\s+)?vk\b[\s,:-]*",
+        r"^(?:in|on)\s+telegram\b[\s,:-]*",
+        r"^(?:в|во)\s+телеграм(?:е)?\b[\s,:-]*",
+        r"^(?:in|on)\s+whatsapp\b[\s,:-]*",
+        r"^(?:в|во)\s+whatsapp\b[\s,:-]*",
+        r"^(?:in|on)\s+gmail\b[\s,:-]*",
+        r"^(?:в|на)\s+gmail\b[\s,:-]*",
+    )
+    for pattern in leading_site_patterns:
+        updated = re.sub(pattern, "", normalized, flags=re.IGNORECASE).strip()
+        if updated != normalized:
+            normalized = updated
+            break
+
+    trailing_site_patterns = (
+        r"[\s,:-]*(?:во|в)\s+вконтакте\b$",
+        r"[\s,:-]*(?:во|в)\s+вк\b$",
+        r"[\s,:-]*(?:во|в)\s+vk\b$",
+        r"[\s,:-]*on\s+vk\b$",
+        r"[\s,:-]*(?:в|во)\s+телеграм(?:е)?\b$",
+        r"[\s,:-]*(?:in|on)\s+telegram\b$",
+        r"[\s,:-]*(?:в|во)\s+whatsapp\b$",
+        r"[\s,:-]*(?:in|on)\s+whatsapp\b$",
+        r"[\s,:-]*(?:в|на)\s+gmail\b$",
+        r"[\s,:-]*(?:in|on)\s+gmail\b$",
+    )
+    for pattern in trailing_site_patterns:
+        updated = re.sub(pattern, "", normalized, flags=re.IGNORECASE).strip()
+        if updated != normalized:
+            normalized = updated
             break
 
     return normalized.strip(" \"'")
@@ -769,12 +798,76 @@ class TaskStore:
         if category == "navigation_failed":
             return "Я не смог открыть нужную страницу автоматически."
         if category == "element_not_found":
+            if tool == "browser.message.draft" and "vk" in site_name:
+                return "Я открыл VK, но не смог найти нужный диалог. Проверьте имя получателя и что нужный чат доступен в сообщениях."
+            if tool == "browser.message.send":
+                return "Сообщение было подготовлено, но я не смог повторно найти поле ввода или кнопку отправки."
             return "Я открыл страницу, но не смог найти нужный элемент интерфейса."
         if category == "timeout":
             return "Сайт не ответил вовремя. Попробуйте повторить запрос чуть позже."
         if category == "rate_limit":
             return "Сайт временно ограничил частоту действий. Попробуйте немного позже."
         return "Я не смог выполнить действие в браузере."
+
+    def _prepare_message_action(
+        self,
+        query: str,
+        trace: list[TraceItem],
+        trace_id: str,
+        session_id: str | None,
+        result: TaskResult,
+        plan: dict[str, Any],
+    ) -> tuple[str, str | None, str | None]:
+        site_url = str(plan.get("site_url") or resolve_site_url(query) or "").strip()
+        destination_hint = str(plan.get("destination_hint") or extract_message_destination(query)).strip()
+        message_text = str(plan.get("message_text") or extract_message_text(query)).strip()
+
+        if not site_url:
+            return "failed", session_id, "Я не смог определить сайт, где нужно подготовить сообщение."
+        if not destination_hint:
+            return "failed", session_id, "Я не смог определить получателя сообщения."
+        if not message_text:
+            return "failed", session_id, "Я не смог определить текст сообщения."
+
+        session_id, open_err = self._open_site_for_query(trace, trace_id, session_id, query)
+        if open_err is not None:
+            return "failed", session_id, self._humanize_tool_error("browser.open", open_err, query)
+
+        draft_resp, draft_err = self._call_tool_with_error(
+            trace=trace,
+            trace_id=trace_id,
+            tool="browser.message.draft",
+            session_id=session_id,
+            input_data={
+                "destination_hint": destination_hint,
+                "message_text": message_text,
+            },
+        )
+        if draft_err is not None:
+            return "failed", session_id, self._humanize_tool_error("browser.message.draft", draft_err, site_url or query)
+        if not isinstance(draft_resp, dict):
+            return "failed", session_id, "Не удалось подготовить сообщение в браузере."
+
+        session_id = str(draft_resp.get("session_id") or session_id or "") or session_id
+        draft_output = draft_resp.get("output", {})
+        payload = draft_output.copy() if isinstance(draft_output, dict) else {}
+        payload.setdefault("site_url", site_url)
+        payload.setdefault("destination_hint", destination_hint)
+        payload.setdefault("message_text", message_text)
+        if session_id is not None:
+            payload["session_id"] = session_id
+
+        action_id = str(payload.get("action_id") or uuid4())
+        result.actions.append(
+            ActionItem(
+                action_id=action_id,
+                type="message_send",
+                status="waiting_confirm",
+                payload=payload,
+            )
+        )
+        result.sources = self._merge_sources([site_url], result.sources)
+        return "needs_confirmation", session_id, None
 
     def _open_site_for_query(
         self,
@@ -1479,7 +1572,7 @@ class TaskStore:
                 search_query,
             )
 
-        session_id, open_err = self._call_tool_with_error(
+        open_resp, open_err = self._call_tool_with_error(
             trace=trace,
             trace_id=trace_id,
             tool="browser.open",
@@ -1488,6 +1581,8 @@ class TaskStore:
         )
         if open_err is not None:
             return "failed", session_id, self._humanize_tool_error("browser.open", open_err, query)
+        if isinstance(open_resp, dict):
+            session_id = open_resp.get("session_id") or session_id
 
         history: list[dict[str, Any]] = []
         for step_index in range(1, 9):
@@ -2371,46 +2466,15 @@ class TaskStore:
         product_sources = [result.product.url] if self._has_product_data(result.product) and result.product is not None else []
         result.sources = self._merge_sources(product_sources, news_sources, search_sources)
 
-        if req.allow_social_actions and supports_browser_action:
-            session_id, open_err = self._open_site_for_query(trace, trace_id, session_id, req.query)
-            if open_err is not None:
-                status = "failed"
-                task_error = self._humanize_tool_error("browser.open", open_err, req.query)
-            draft_resp = None
-            draft_err = None
-            if task_error is None:
-                draft_resp, draft_err = self._call_tool_with_error(
-                    trace=trace,
-                    trace_id=trace_id,
-                    tool="browser.message.draft",
-                    session_id=session_id,
-                    input_data={
-                        "destination_hint": plan["destination_hint"],
-                        "message_text": plan["message_text"],
-                    },
-                )
-
-            if draft_err is not None:
-                status = "failed"
-                task_error = self._humanize_tool_error("browser.message.draft", draft_err, req.query)
-            elif isinstance(draft_resp, dict):
-                draft_output = draft_resp.get("output", {})
-                action_id = draft_output.get("action_id", str(uuid4()))
-                payload = draft_output if isinstance(draft_output, dict) else {}
-                if draft_resp.get("session_id") is not None:
-                    payload["session_id"] = draft_resp.get("session_id")
-                result.actions.append(
-                    ActionItem(
-                        action_id=action_id,
-                        type="message_send",
-                        status="waiting_confirm",
-                        payload=payload,
-                    )
-                )
-                status = "needs_confirmation"
-            else:
-                status = "failed"
-                task_error = "Не удалось подготовить сообщение в браузере."
+        if req.allow_social_actions and supports_browser_action and plan["wants_message"]:
+            status, session_id, task_error = self._prepare_message_action(
+                query=req.query,
+                trace=trace,
+                trace_id=trace_id,
+                session_id=session_id,
+                result=result,
+                plan=plan,
+            )
         else:
             status = "done"
 
@@ -2486,13 +2550,23 @@ class TaskStore:
             return task
 
         if request_route == "browser_action_request":
-            status, session_id, task_error = self._run_browser_action_agent_v2(
-                query=req.query,
-                trace=trace,
-                trace_id=trace_id,
-                session_id=session_id,
-                result=result,
-            )
+            if plan["wants_message"]:
+                status, session_id, task_error = self._prepare_message_action(
+                    query=req.query,
+                    trace=trace,
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    result=result,
+                    plan=plan,
+                )
+            else:
+                status, session_id, task_error = self._run_browser_action_agent_v2(
+                    query=req.query,
+                    trace=trace,
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    result=result,
+                )
             task.status = status
             task.result = result
             task.error = task_error
@@ -2596,47 +2670,15 @@ class TaskStore:
         product_sources = [result.product.url] if self._has_product_data(result.product) and result.product is not None else []
         result.sources = self._merge_sources(product_sources, news_sources, search_sources)
 
-        if req.allow_social_actions and supports_browser_action:
-            session_id, open_err = self._open_site_for_query(trace, trace_id, session_id, req.query)
-            if open_err is not None:
-                status = "failed"
-                task_error = self._humanize_tool_error("browser.open", open_err, req.query)
-            draft_resp = None
-            draft_err = None
-            if task_error is None:
-                draft_resp, draft_err = self._call_tool_with_error(
-                    trace=trace,
-                    trace_id=trace_id,
-                    tool="browser.message.draft",
-                    session_id=session_id,
-                    input_data={
-                        "destination_hint": plan["destination_hint"],
-                        "message_text": plan["message_text"],
-                    },
-                )
-
-            if draft_err is not None:
-                status = "failed"
-                task_error = self._humanize_tool_error("browser.message.draft", draft_err, req.query)
-            elif isinstance(draft_resp, dict):
-                draft_output = draft_resp.get("output", {})
-                action_id = draft_output.get("action_id", str(uuid4()))
-                payload = draft_output if isinstance(draft_output, dict) else {}
-                if draft_resp.get("session_id") is not None:
-                    payload["session_id"] = draft_resp.get("session_id")
-
-                result.actions.append(
-                    ActionItem(
-                        action_id=action_id,
-                        type="message_send",
-                        status="waiting_confirm",
-                        payload=payload,
-                    )
-                )
-                status = "needs_confirmation"
-            else:
-                status = "failed"
-                task_error = "Не удалось подготовить сообщение в браузере."
+        if req.allow_social_actions and supports_browser_action and plan["wants_message"]:
+            status, session_id, task_error = self._prepare_message_action(
+                query=req.query,
+                trace=trace,
+                trace_id=trace_id,
+                session_id=session_id,
+                result=result,
+                plan=plan,
+            )
         else:
             status = "done"
 
@@ -2743,15 +2785,23 @@ class TaskStore:
                 else:
                     action.status = "failed"
                     task.status = "failed"
+                    failure_query = ""
+                    if isinstance(action.payload, dict):
+                        failure_query = str(
+                            action.payload.get("site_url")
+                            or action.payload.get("message_text")
+                            or action.payload.get("destination_hint")
+                            or ""
+                        )
                     task.error = self._humanize_tool_error(
                         "browser.message.send",
                         send_err or ToolsClientError("tool_error", "Message send failed"),
-                        str(action.payload.get("message_text", "")) if isinstance(action.payload, dict) else "",
+                        failure_query,
                     )
                     self._set_assistant_message_for_task(
                         task.conversation_id,
                         task.task_id,
-                        "Не удалось отправить сообщение. Повторите позже.",
+                        task.error or "Не удалось отправить сообщение. Повторите позже.",
                     )
                     self._append_trace(
                         task.trace,
@@ -2865,4 +2915,3 @@ class TaskStore:
             assistant_message=assistant_message,
             task=task,
         )
-
