@@ -4,18 +4,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/xml"
-	"html"
-	"io"
 	"log"
 	"net/http"
-	neturl "net/url"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
+
+	"github.com/gorilla/websocket"
 )
 
 type ToolCallRequest struct {
@@ -41,70 +37,32 @@ type ToolCallResponse struct {
 	DurationMS int64                  `json:"duration_ms"`
 }
 
-type DraftMessage struct {
-	ActionID        string
-	DestinationHint string
-	MessageText     string
-	SessionID       string
-	CreatedAt       time.Time
-}
-
-type SearchResult struct {
-	Title   string
-	URL     string
-	Snippet string
-}
-
-type NewsItem struct {
-	Title       string
-	Summary     string
-	PublishedAt string
-	URL         string
-	Source      string
-}
-
-type SessionState struct {
-	UpdatedAt         time.Time
-	LastQuery         string
-	LastSearchResults []SearchResult
-	LastNewsItems     []NewsItem
-}
-
-type rssFeed struct {
-	Channel rssChannel `xml:"channel"`
-}
-
-type rssChannel struct {
-	Title string    `xml:"title"`
-	Items []rssItem `xml:"item"`
-}
-
-type rssItem struct {
-	Title       string `xml:"title"`
-	Link        string `xml:"link"`
-	Description string `xml:"description"`
-	PubDate     string `xml:"pubDate"`
-	Source      string `xml:"source"`
+type BridgeMessage struct {
+	Type      string            `json:"type"`
+	ClientID  string            `json:"client_id,omitempty"`
+	Request   *ToolCallRequest  `json:"request,omitempty"`
+	Response  *ToolCallResponse `json:"response,omitempty"`
+	Connected bool              `json:"connected,omitempty"`
 }
 
 type ToolServer struct {
-	mu            sync.Mutex
-	drafts        map[string]DraftMessage
-	sessions      map[string]*SessionState
-	httpClient    *http.Client
-	tagStripper   *regexp.Regexp
-	maxNewsItems  int
-	maxSearchRows int
+	mu                sync.Mutex
+	upgrader          websocket.Upgrader
+	bridgeConn        *websocket.Conn
+	bridgeClientID    string
+	bridgeConnectedAt time.Time
+	pending           map[string]chan ToolCallResponse
+	writeMu           sync.Mutex
+	toolTimeout       time.Duration
 }
 
 func newToolServer() *ToolServer {
 	return &ToolServer{
-		drafts:        make(map[string]DraftMessage),
-		sessions:      make(map[string]*SessionState),
-		httpClient:    &http.Client{Timeout: 20 * time.Second},
-		tagStripper:   regexp.MustCompile("<[^>]+>"),
-		maxNewsItems:  5,
-		maxSearchRows: 5,
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(_ *http.Request) bool { return true },
+		},
+		pending:     make(map[string]chan ToolCallResponse),
+		toolTimeout: 30 * time.Second,
 	}
 }
 
@@ -116,47 +74,19 @@ func newID(prefix string) string {
 	return prefix + hex.EncodeToString(buf)
 }
 
-func (s *ToolServer) ensureSession(sessionID string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if strings.TrimSpace(sessionID) == "" {
-		sessionID = newID("sess-")
-	}
-	state, ok := s.sessions[sessionID]
-	if !ok {
-		state = &SessionState{}
-		s.sessions[sessionID] = state
-	}
-	state.UpdatedAt = time.Now().UTC()
-	return sessionID
-}
-
-func (s *ToolServer) updateSessionSearch(sessionID, query string, results []SearchResult, news []NewsItem) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	state, ok := s.sessions[sessionID]
-	if !ok {
-		state = &SessionState{}
-		s.sessions[sessionID] = state
-	}
-	state.UpdatedAt = time.Now().UTC()
-	state.LastQuery = query
-	state.LastSearchResults = append([]SearchResult(nil), results...)
-	state.LastNewsItems = append([]NewsItem(nil), news...)
-}
-
-func (s *ToolServer) getSessionNews(sessionID string) []NewsItem {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	state, ok := s.sessions[sessionID]
-	if !ok {
-		return nil
-	}
-	return append([]NewsItem(nil), state.LastNewsItems...)
-}
-
 func (s *ToolServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	s.mu.Lock()
+	connected := s.bridgeConn != nil
+	clientID := s.bridgeClientID
+	connectedAt := s.bridgeConnectedAt
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":              "ok",
+		"bridge_connected":    connected,
+		"bridge_client_id":    clientID,
+		"bridge_connected_at": connectedAt,
+	})
 }
 
 func (s *ToolServer) handleCallTool(w http.ResponseWriter, r *http.Request) {
@@ -172,308 +102,230 @@ func (s *ToolServer) handleCallTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionID := s.ensureSession(req.SessionID)
-	resp := ToolCallResponse{
-		TraceID:   req.TraceID,
-		SessionID: sessionID,
-		Tool:      req.Tool,
-		OK:        true,
-		Output:    map[string]interface{}{},
-		Error:     nil,
+	if strings.TrimSpace(req.TraceID) == "" {
+		req.TraceID = newID("trace-")
 	}
 
-	switch req.Tool {
-	case "browser.search":
-		query := asString(req.Input["query"])
-		results, news, err := s.fetchNewsSearch(query)
-		if err != nil || len(results) == 0 {
-			results = s.fallbackSearchResults(query)
-			news = nil
-		}
-		s.updateSessionSearch(sessionID, query, results, news)
-		resp.Output = map[string]interface{}{
-			"results": searchResultsToMaps(results),
-		}
-	case "browser.extract":
-		schemaType := ""
-		if schema, ok := req.Input["schema"].(map[string]interface{}); ok {
-			schemaType = asString(schema["type"])
-		}
-		switch schemaType {
-		case "news":
-			items := s.getSessionNews(sessionID)
-			if len(items) == 0 {
-				items = []NewsItem{}
-			}
-			resp.Output = map[string]interface{}{
-				"items": newsItemsToMaps(items),
-			}
-		default:
-			resp.Output = map[string]interface{}{
-				"items": []map[string]interface{}{
-					{
-						"title":         "iPhone 15 256GB (mock)",
-						"price":         89990,
-						"currency":      "RUB",
-						"url":           "https://example.com/product/iphone-15-256",
-						"seller":        "MockStore",
-						"rating":        4.8,
-						"reviews_count": 132,
-						"delivery":      "2 дня",
-						"condition":     "new",
-						"storage_gb":    256,
-					},
-				},
-			}
-		}
-	case "browser.message.draft":
-		actionID := newID("act-")
-		destinationHint := asString(req.Input["destination_hint"])
-		messageText := asString(req.Input["message_text"])
-		s.mu.Lock()
-		s.drafts[actionID] = DraftMessage{
-			ActionID:        actionID,
-			DestinationHint: destinationHint,
-			MessageText:     messageText,
-			SessionID:       sessionID,
-			CreatedAt:       time.Now().UTC(),
-		}
-		s.mu.Unlock()
+	if strings.TrimSpace(req.Tool) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_tool"})
+		return
+	}
 
-		resp.Output = map[string]interface{}{
-			"action_id":        actionID,
-			"destination_hint": destinationHint,
-			"message_text":     messageText,
-			"status":           "waiting_confirm",
-			"resolved_recipient": map[string]interface{}{
-				"name":       destinationHint,
-				"confidence": 0.7,
+	response, ok := s.dispatchToBridge(req)
+	if !ok {
+		resp := ToolCallResponse{
+			TraceID:    req.TraceID,
+			SessionID:  req.SessionID,
+			Tool:       req.Tool,
+			OK:         false,
+			Output:     map[string]interface{}{},
+			DurationMS: time.Since(start).Milliseconds(),
+			Error: &ToolError{
+				Code:      "BRIDGE_UNAVAILABLE",
+				Message:   "browser extension is not connected",
+				Retryable: true,
 			},
 		}
-	case "browser.message.send":
-		actionID := asString(req.Input["action_id"])
-		confirm := asBool(req.Input["confirm"])
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 
+	if response.TraceID == "" {
+		response.TraceID = req.TraceID
+	}
+	if response.Tool == "" {
+		response.Tool = req.Tool
+	}
+	if response.SessionID == "" {
+		response.SessionID = req.SessionID
+	}
+	response.DurationMS = time.Since(start).Milliseconds()
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *ToolServer) dispatchToBridge(req ToolCallRequest) (ToolCallResponse, bool) {
+	s.mu.Lock()
+	conn := s.bridgeConn
+	s.mu.Unlock()
+	if conn == nil {
+		return ToolCallResponse{}, false
+	}
+
+	responseCh := make(chan ToolCallResponse, 1)
+
+	s.mu.Lock()
+	s.pending[req.TraceID] = responseCh
+	s.mu.Unlock()
+
+	err := s.writeBridgeMessage(BridgeMessage{
+		Type:    "tool_request",
+		Request: &req,
+	})
+	if err != nil {
 		s.mu.Lock()
-		draft, exists := s.drafts[actionID]
-		if exists {
-			delete(s.drafts, actionID)
+		delete(s.pending, req.TraceID)
+		s.mu.Unlock()
+		return ToolCallResponse{}, false
+	}
+
+	select {
+	case response := <-responseCh:
+		return response, true
+	case <-time.After(s.toolTimeout):
+		s.mu.Lock()
+		delete(s.pending, req.TraceID)
+		s.mu.Unlock()
+		return ToolCallResponse{
+			TraceID:   req.TraceID,
+			SessionID: req.SessionID,
+			Tool:      req.Tool,
+			OK:        false,
+			Output:    map[string]interface{}{},
+			Error: &ToolError{
+				Code:      "TIMEOUT",
+				Message:   "tool response timeout waiting for browser extension",
+				Retryable: true,
+			},
+		}, true
+	}
+}
+
+func (s *ToolServer) handleBridgeWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("bridge upgrade failed: %v", err)
+		return
+	}
+
+	clientID := newID("ext-")
+	s.registerBridgeConnection(conn, clientID)
+	log.Printf("bridge connected: %s", clientID)
+
+	_ = s.writeBridgeMessage(BridgeMessage{
+		Type:      "bridge_state",
+		ClientID:  clientID,
+		Connected: true,
+	})
+
+	go s.heartbeatLoop(conn, clientID)
+	s.readBridgeLoop(conn, clientID)
+}
+
+func (s *ToolServer) registerBridgeConnection(conn *websocket.Conn, clientID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.bridgeConn != nil {
+		_ = s.bridgeConn.Close()
+	}
+
+	s.bridgeConn = conn
+	s.bridgeClientID = clientID
+	s.bridgeConnectedAt = time.Now().UTC()
+}
+
+func (s *ToolServer) readBridgeLoop(conn *websocket.Conn, clientID string) {
+	defer func() {
+		s.unregisterBridgeConnection(conn, clientID)
+		_ = conn.Close()
+		log.Printf("bridge disconnected: %s", clientID)
+	}()
+
+	for {
+		var msg BridgeMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			return
 		}
+
+		switch msg.Type {
+		case "hello":
+			continue
+		case "pong":
+			continue
+		case "tool_response":
+			if msg.Response == nil {
+				continue
+			}
+
+			s.mu.Lock()
+			responseCh, ok := s.pending[msg.Response.TraceID]
+			if ok {
+				delete(s.pending, msg.Response.TraceID)
+			}
+			s.mu.Unlock()
+
+			if ok {
+				responseCh <- *msg.Response
+			}
+		}
+	}
+}
+
+func (s *ToolServer) heartbeatLoop(conn *websocket.Conn, clientID string) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.mu.Lock()
+		currentConn := s.bridgeConn
+		currentClientID := s.bridgeClientID
 		s.mu.Unlock()
 
-		if !exists || !confirm {
-			resp.OK = false
-			resp.Error = &ToolError{
-				Code:      "VALIDATION_ERROR",
-				Message:   "invalid action_id or confirm flag",
-				Retryable: false,
-			}
-			resp.Output = map[string]interface{}{
-				"status": "failed",
-			}
-		} else {
-			resp.Output = map[string]interface{}{
-				"status":      "sent",
-				"action_id":   actionID,
-				"message_ref": newID("msg-"),
-				"recipient":   draft.DestinationHint,
-			}
-		}
-	default:
-		resp.OK = false
-		resp.Error = &ToolError{
-			Code:      "UNKNOWN_TOOL",
-			Message:   "unsupported tool: " + req.Tool,
-			Retryable: false,
-		}
-	}
-
-	resp.DurationMS = time.Since(start).Milliseconds()
-	writeJSON(w, http.StatusOK, resp)
-}
-
-func (s *ToolServer) fetchNewsSearch(query string) ([]SearchResult, []NewsItem, error) {
-	query = strings.TrimSpace(query)
-	if query == "" {
-		return nil, nil, nil
-	}
-
-	lang := "en"
-	region := "US"
-	if containsCyrillic(query) {
-		lang = "ru"
-		region = "RU"
-	}
-
-	endpoint := "https://news.google.com/rss/search?q=" + neturl.QueryEscape(query) +
-		"&hl=" + lang + "&gl=" + region + "&ceid=" + region + ":" + lang
-
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	req.Header.Set("User-Agent", "ai-helper-tools-go/0.1")
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, nil, io.ErrUnexpectedEOF
-	}
-
-	var feed rssFeed
-	if err := xml.NewDecoder(resp.Body).Decode(&feed); err != nil {
-		return nil, nil, err
-	}
-
-	results := make([]SearchResult, 0, s.maxSearchRows)
-	items := make([]NewsItem, 0, s.maxNewsItems)
-	for _, item := range feed.Channel.Items {
-		link := strings.TrimSpace(item.Link)
-		title := cleanText(item.Title)
-		if link == "" || title == "" {
-			continue
-		}
-		summary := cleanText(item.Description)
-		if summary == "" {
-			summary = title
-		}
-		source := cleanText(item.Source)
-		if source == "" {
-			source = "Google News"
+		if currentConn != conn || currentClientID != clientID {
+			return
 		}
 
-		results = append(results, SearchResult{
-			Title:   title,
-			URL:     link,
-			Snippet: summary,
-		})
-		items = append(items, NewsItem{
-			Title:       title,
-			Summary:     summary,
-			PublishedAt: normalizePubDate(item.PubDate),
-			URL:         link,
-			Source:      source,
-		})
-		if len(results) >= s.maxSearchRows && len(items) >= s.maxNewsItems {
-			break
+		if err := s.writeBridgeMessage(BridgeMessage{
+			Type:     "ping",
+			ClientID: clientID,
+		}); err != nil {
+			_ = conn.Close()
+			return
 		}
 	}
-
-	if len(results) > s.maxSearchRows {
-		results = results[:s.maxSearchRows]
-	}
-	if len(items) > s.maxNewsItems {
-		items = items[:s.maxNewsItems]
-	}
-
-	return results, items, nil
 }
 
-func (s *ToolServer) fallbackSearchResults(query string) []SearchResult {
-	return []SearchResult{
-		{
-			Title:   "Mock result: " + query,
-			URL:     "https://example.com/search?q=" + neturl.QueryEscape(query),
-			Snippet: "Mock search result from tools-go",
-		},
-		{
-			Title:   "Mock marketplace listing",
-			URL:     "https://example.com/product/iphone-256",
-			Snippet: "iPhone 256 mock listing",
-		},
-	}
-}
+func (s *ToolServer) unregisterBridgeConnection(conn *websocket.Conn, clientID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-func searchResultsToMaps(items []SearchResult) []map[string]interface{} {
-	out := make([]map[string]interface{}, 0, len(items))
-	for _, item := range items {
-		out = append(out, map[string]interface{}{
-			"title":   item.Title,
-			"url":     item.URL,
-			"snippet": item.Snippet,
-		})
+	if s.bridgeConn == conn {
+		s.bridgeConn = nil
+		s.bridgeClientID = ""
+		s.bridgeConnectedAt = time.Time{}
 	}
-	return out
-}
 
-func newsItemsToMaps(items []NewsItem) []map[string]interface{} {
-	out := make([]map[string]interface{}, 0, len(items))
-	for _, item := range items {
-		out = append(out, map[string]interface{}{
-			"title":        item.Title,
-			"summary":      item.Summary,
-			"published_at": item.PublishedAt,
-			"url":          item.URL,
-			"source":       item.Source,
-		})
-	}
-	return out
-}
-
-func normalizePubDate(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return time.Now().UTC().Format(time.RFC3339)
-	}
-	layouts := []string{
-		time.RFC1123Z,
-		time.RFC1123,
-		time.RFC822Z,
-		time.RFC822,
-		time.RFC3339,
-	}
-	for _, layout := range layouts {
-		parsed, err := time.Parse(layout, raw)
-		if err == nil {
-			return parsed.UTC().Format(time.RFC3339)
+	for traceID, responseCh := range s.pending {
+		select {
+		case responseCh <- ToolCallResponse{
+			TraceID: traceID,
+			OK:      false,
+			Output:  map[string]interface{}{},
+			Error: &ToolError{
+				Code:      "BRIDGE_UNAVAILABLE",
+				Message:   "browser extension disconnected",
+				Retryable: true,
+			},
+		}:
+		default:
 		}
+		delete(s.pending, traceID)
 	}
-	return time.Now().UTC().Format(time.RFC3339)
 }
 
-func cleanText(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	raw = html.UnescapeString(raw)
-	re := regexp.MustCompile("<[^>]+>")
-	raw = re.ReplaceAllString(raw, " ")
-	raw = strings.Join(strings.Fields(raw), " ")
-	return raw
-}
+func (s *ToolServer) writeBridgeMessage(msg BridgeMessage) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
-func containsCyrillic(s string) bool {
-	for _, r := range s {
-		if unicode.In(r, unicode.Cyrillic) {
-			return true
-		}
+	s.mu.Lock()
+	conn := s.bridgeConn
+	s.mu.Unlock()
+	if conn == nil {
+		return websocket.ErrCloseSent
 	}
-	return false
-}
 
-func asString(v interface{}) string {
-	if v == nil {
-		return ""
-	}
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
-}
-
-func asBool(v interface{}) bool {
-	if v == nil {
-		return false
-	}
-	if b, ok := v.(bool); ok {
-		return b
-	}
-	return false
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	return conn.WriteJSON(msg)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
@@ -492,6 +344,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/mcp/tool/call", srv.handleCallTool)
+	mux.HandleFunc("/bridge/ws", srv.handleBridgeWS)
 
 	addr := "0.0.0.0:" + port
 	log.Printf("tools-go listening on http://%s", addr)

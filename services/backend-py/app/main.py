@@ -98,7 +98,7 @@ def create_message(
     if created is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     background_tasks.add_task(
-        store.process_task,
+        store.process_task_safe,
         created.task.task_id,
         TaskCreateRequest(query=req.content, allow_social_actions=req.allow_social_actions),
     )
