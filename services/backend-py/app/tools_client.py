@@ -76,7 +76,7 @@ class ToolsClient:
             "input": input_data,
         }
 
-        last_error: str | None = None
+        last_exc: ToolsClientError | None = None
         for attempt in range(self.retries + 1):
             try:
                 req = request.Request(
@@ -103,26 +103,28 @@ class ToolsClient:
                 return data
             except error.HTTPError as exc:
                 typed_exc = self._classify_http_error(exc)
-                last_error = f"{typed_exc.category}: {typed_exc.message}"
+                last_exc = typed_exc
                 if attempt < self.retries:
                     time.sleep(0.4 * (attempt + 1))
                     continue
             except (error.URLError, TimeoutError, socket.timeout) as exc:
                 typed_exc = self._classify_network_error(exc)
-                last_error = f"{typed_exc.category}: {typed_exc.message}"
+                last_exc = typed_exc
                 if attempt < self.retries:
                     time.sleep(0.4 * (attempt + 1))
                     continue
             except json.JSONDecodeError as exc:
                 typed_exc = ToolsClientError("invalid_response", f"invalid json: {exc}")
-                last_error = f"{typed_exc.category}: {typed_exc.message}"
+                last_exc = typed_exc
                 if attempt < self.retries:
                     time.sleep(0.4 * (attempt + 1))
                     continue
             except ToolsClientError as exc:
-                last_error = f"{exc.category}: {exc.message}"
+                last_exc = exc
                 if attempt < self.retries:
                     time.sleep(0.4 * (attempt + 1))
                     continue
 
-        raise ToolsClientError("call_failed", f"tool call failed after retries: {last_error or 'unknown error'}")
+        if last_exc is not None:
+            raise last_exc
+        raise ToolsClientError("call_failed", "tool call failed after retries: unknown error")

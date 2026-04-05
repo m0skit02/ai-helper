@@ -3,7 +3,7 @@
   "name": "AI Helper Tools Tester",
   "version": "1.0",
   "description": "MVP расширения для тестирования browser tools через JSON-envelope",
-  "permissions": ["tabs", "scripting", "activeTab", "storage"],
+  "permissions": ["tabs", "scripting", "activeTab", "storage", "alarms"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js"

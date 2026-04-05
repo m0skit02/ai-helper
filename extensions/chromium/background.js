@@ -14,9 +14,45 @@ const DEFAULT_BRIDGE_CONFIG = {
     backendUrl: "",
     apiKey: "",
     forwardResponsesToBackend: false,
+    bridgeWebSocketUrl: "ws://127.0.0.1:8080/bridge/ws",
+    autoConnectBridge: true,
 };
 
 const draftActions = new Map();
+const browserSessions = new Map();
+const bridgeState = {
+    socket: null,
+    connected: false,
+    connecting: false,
+    lastError: "",
+    reconnectTimer: null,
+};
+
+chrome.runtime.onInstalled.addListener(() => {
+    chrome.alarms.create("ai-helper-bridge-reconnect", { periodInMinutes: 1 });
+    void initializeBridge();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+    chrome.alarms.create("ai-helper-bridge-reconnect", { periodInMinutes: 1 });
+    void initializeBridge();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm?.name === "ai-helper-bridge-reconnect") {
+        void initializeBridge();
+    }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+    for (const [sessionId, session] of browserSessions.entries()) {
+        if (session?.tabId === tabId) {
+            browserSessions.delete(sessionId);
+        }
+    }
+});
+
+void initializeBridge();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message?.type) {
@@ -39,7 +75,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return true;
         case MESSAGE_TYPES.popupSaveBridgeConfig:
             saveBridgeConfig(message.payload)
-                .then(sendResponse)
+                .then(async (response) => {
+                    await initializeBridge(true);
+                    sendResponse(response);
+                })
                 .catch((error) => {
                     sendResponse({
                         ok: false,
@@ -51,6 +90,135 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return false;
     }
 });
+
+async function initializeBridge(forceReconnect = false) {
+    const config = await loadBridgeConfig();
+    if (!config.autoConnectBridge || !config.bridgeWebSocketUrl) {
+        disconnectBridge();
+        return;
+    }
+
+    if (forceReconnect) {
+        disconnectBridge();
+    }
+
+    connectBridge(config);
+}
+
+function connectBridge(config) {
+    if (bridgeState.connected || bridgeState.connecting) {
+        return;
+    }
+
+    bridgeState.connecting = true;
+    bridgeState.lastError = "";
+
+    try {
+        const socket = new WebSocket(config.bridgeWebSocketUrl);
+        bridgeState.socket = socket;
+
+        socket.onopen = () => {
+            bridgeState.connected = true;
+            bridgeState.connecting = false;
+            bridgeState.lastError = "";
+            sendBridgeMessage({
+                type: "hello",
+                client_id: chrome.runtime.id,
+            });
+        };
+
+        socket.onmessage = (event) => {
+            void handleBridgeMessage(event.data);
+        };
+
+        socket.onerror = () => {
+            bridgeState.lastError = "bridge socket error";
+        };
+
+        socket.onclose = () => {
+            bridgeState.connected = false;
+            bridgeState.connecting = false;
+            bridgeState.socket = null;
+            scheduleReconnect();
+        };
+    } catch (error) {
+        bridgeState.connected = false;
+        bridgeState.connecting = false;
+        bridgeState.lastError = error.message;
+        scheduleReconnect();
+    }
+}
+
+function disconnectBridge() {
+    if (bridgeState.reconnectTimer) {
+        clearTimeout(bridgeState.reconnectTimer);
+        bridgeState.reconnectTimer = null;
+    }
+
+    if (bridgeState.socket) {
+        bridgeState.socket.close();
+    }
+
+    bridgeState.socket = null;
+    bridgeState.connected = false;
+    bridgeState.connecting = false;
+}
+
+function scheduleReconnect() {
+    if (bridgeState.reconnectTimer) {
+        clearTimeout(bridgeState.reconnectTimer);
+    }
+
+    bridgeState.reconnectTimer = setTimeout(() => {
+        bridgeState.reconnectTimer = null;
+        void initializeBridge();
+    }, 2000);
+}
+
+async function handleBridgeMessage(rawData) {
+    let message;
+    try {
+        message = JSON.parse(rawData);
+    } catch (_error) {
+        return;
+    }
+
+    if (message?.type === "ping") {
+        sendBridgeMessage({
+            type: "pong",
+            client_id: chrome.runtime.id,
+        });
+        return;
+    }
+
+    if (message?.type === "bridge_state") {
+        bridgeState.lastError = "";
+        return;
+    }
+
+    if (message?.type !== "tool_request" || !message.request) {
+        return;
+    }
+
+    const response = await dispatchEnvelope(message.request, {
+        source: "bridge",
+    });
+
+    sendBridgeMessage({
+        type: "tool_response",
+        client_id: chrome.runtime.id,
+        response,
+    });
+}
+
+function sendBridgeMessage(message) {
+    const socket = bridgeState.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+        return;
+    }
+
+    socket.send(JSON.stringify(message));
+}
 
 async function handlePopupRun(envelope, sender) {
     return dispatchEnvelope(envelope, {
@@ -67,12 +235,6 @@ async function dispatchEnvelope(envelope, context = {}) {
         return buildErrorEnvelope({}, "INTERNAL", "Некорректный envelope.", false, 0);
     }
 
-    if (bridgeConfig.mode === "backend") {
-        // Placeholder for future backend transport.
-        // The execution contract already goes through this dispatcher, so
-        // swapping transports later will not affect popup/content logic.
-    }
-
     const response = await executeEnvelopeLocally(envelope, context);
     response.duration_ms = Date.now() - startedAt;
 
@@ -84,11 +246,15 @@ async function dispatchEnvelope(envelope, context = {}) {
 }
 
 async function executeEnvelopeLocally(envelope, context = {}) {
+    if (envelope.tool === "browser.open") {
+        return handleBrowserOpen(envelope);
+    }
+
     if (envelope.tool === "browser.message.send") {
         return handleMessageSend(envelope);
     }
 
-    const tab = await resolveActiveTab(context.sender);
+    const tab = await resolveTargetTab(envelope, context.sender);
     if (!tab?.id) {
         return buildErrorEnvelope(envelope, "NAVIGATION_FAILED", "Не удалось определить активную вкладку.", true, 0);
     }
@@ -104,11 +270,7 @@ async function executeEnvelopeLocally(envelope, context = {}) {
     }
 
     await ensureContentScript(tab.id);
-
-    const response = await chrome.tabs.sendMessage(tab.id, {
-        type: MESSAGE_TYPES.contentRequest,
-        payload: envelope,
-    });
+    const response = await sendEnvelopeToTab(tab.id, envelope);
 
     if (response?.ok && envelope.tool === "browser.message.draft" && response.output?.draft_ready) {
         draftActions.set(response.output.action_id, {
@@ -119,6 +281,97 @@ async function executeEnvelopeLocally(envelope, context = {}) {
     }
 
     return response;
+}
+
+async function handleBrowserOpen(envelope) {
+    const input = envelope?.input || {};
+    const url = String(input.url || "").trim();
+    const sessionId = envelope?.session_id || crypto.randomUUID();
+
+    if (!/^https?:\/\//i.test(url)) {
+        return buildErrorEnvelope(envelope, "NAVIGATION_FAILED", "Не передан корректный input.url.", false, 0);
+    }
+
+    const activate = input.activate === true;
+    let tab = null;
+    const existingSession = browserSessions.get(sessionId);
+
+    if (existingSession?.tabId) {
+        try {
+            tab = await chrome.tabs.update(existingSession.tabId, {
+                url,
+                active: activate,
+            });
+        } catch (_error) {
+            browserSessions.delete(sessionId);
+        }
+    }
+
+    if (!tab) {
+        tab = await chrome.tabs.create({ url, active: activate });
+    }
+
+    if (tab?.id) {
+        await waitForTabComplete(tab.id, 15000);
+        browserSessions.set(sessionId, {
+            tabId: tab.id,
+            url,
+            updatedAt: Date.now(),
+        });
+    }
+
+    return {
+        trace_id: envelope?.trace_id || crypto.randomUUID(),
+        session_id: sessionId,
+        tool: envelope?.tool || "browser.open",
+        ok: true,
+        output: {
+            opened: true,
+            url,
+            tab_id: tab?.id || null,
+        },
+        error: null,
+        duration_ms: 0,
+    };
+}
+
+function waitForTabComplete(tabId, timeoutMs) {
+    return new Promise((resolve) => {
+        let finished = false;
+
+        const done = () => {
+            if (finished) {
+                return;
+            }
+            finished = true;
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+            clearTimeout(timer);
+            resolve();
+        };
+
+        const onUpdated = (updatedTabId, changeInfo) => {
+            if (updatedTabId !== tabId) {
+                return;
+            }
+            if (changeInfo.status === "complete") {
+                done();
+            }
+        };
+
+        const timer = setTimeout(done, timeoutMs);
+
+        chrome.tabs.get(tabId)
+            .then((tab) => {
+                if (tab?.status === "complete") {
+                    done();
+                    return;
+                }
+                chrome.tabs.onUpdated.addListener(onUpdated);
+            })
+            .catch(() => {
+                chrome.tabs.onUpdated.addListener(onUpdated);
+            });
+    });
 }
 
 async function handleMessageSend(envelope) {
@@ -143,15 +396,11 @@ async function handleMessageSend(envelope) {
     }
 
     await ensureContentScript(action.tabId);
-
-    const response = await chrome.tabs.sendMessage(action.tabId, {
-        type: MESSAGE_TYPES.contentRequest,
-        payload: {
-            ...envelope,
-            input: {
-                ...envelope.input,
-                action_id: actionId,
-            },
+    const response = await sendEnvelopeToTab(action.tabId, {
+        ...envelope,
+        input: {
+            ...envelope.input,
+            action_id: actionId,
         },
     });
 
@@ -175,6 +424,25 @@ async function resolveActiveTab(sender) {
     return tab;
 }
 
+async function resolveTargetTab(envelope, sender) {
+    const sessionId = envelope?.session_id;
+    if (sessionId && browserSessions.has(sessionId)) {
+        const session = browserSessions.get(sessionId);
+        if (session?.tabId) {
+            try {
+                const tab = await chrome.tabs.get(session.tabId);
+                if (tab?.id) {
+                    return tab;
+                }
+            } catch (_error) {
+                browserSessions.delete(sessionId);
+            }
+        }
+    }
+
+    return resolveActiveTab(sender);
+}
+
 async function ensureContentScript(tabId) {
     try {
         await chrome.tabs.sendMessage(tabId, {
@@ -190,15 +458,48 @@ async function ensureContentScript(tabId) {
             target: { tabId },
             files: ["contentScript.js"],
         });
+        await wait(300);
     }
 }
 
+async function sendEnvelopeToTab(tabId, envelope) {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+            return await chrome.tabs.sendMessage(tabId, {
+                type: MESSAGE_TYPES.contentRequest,
+                payload: envelope,
+            });
+        } catch (error) {
+            lastError = error;
+            try {
+                await ensureContentScript(tabId);
+            } catch (_injectError) {
+                if (attempt === 3) {
+                    throw error;
+                }
+            }
+            await wait(250 * attempt);
+        }
+    }
+
+    throw lastError || new Error("Failed to deliver message to content script.");
+}
+
 async function getBridgeState() {
+    if (!bridgeState.connected && !bridgeState.connecting) {
+        await initializeBridge();
+    }
+
     const bridgeConfig = await loadBridgeConfig();
     return {
         ok: true,
         config: bridgeConfig,
         draft_actions_count: draftActions.size,
+        connected: bridgeState.connected,
+        connecting: bridgeState.connecting,
+        last_error: bridgeState.lastError,
     };
 }
 
@@ -280,4 +581,8 @@ function isRestrictedUrl(url) {
 
 function isObject(value) {
     return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function wait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }

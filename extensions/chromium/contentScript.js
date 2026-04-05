@@ -2,6 +2,7 @@ const AI_HELPER_CONTENT_MESSAGE = "AI_HELPER_CONTENT_REQUEST";
 const MAX_RESULTS = 10;
 
 const draftedActions = new Map();
+const scannedElements = new Map();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type !== AI_HELPER_CONTENT_MESSAGE) {
@@ -57,6 +58,10 @@ async function handleEnvelope(envelope) {
     }
 
     switch (tool) {
+        case "browser.scan":
+            return runTool(envelope, handleBrowserScan);
+        case "browser.act":
+            return runTool(envelope, handleBrowserAct);
         case "browser.search":
             return runTool(envelope, handleBrowserSearch);
         case "browser.extract":
@@ -153,6 +158,14 @@ async function handleBrowserExtract(input) {
     const fields = Array.isArray(schema.fields) ? schema.fields : [];
 
     const cards = collectCandidateCards(limit);
+    const schemaType = String(schema.type || "").toLowerCase();
+    if (!cards.length && schemaType === "product") {
+        return {
+            schema,
+            mode: input?.mode || "dom_first",
+            items: [extractFieldsFromCard(document.body, fields)],
+        };
+    }
     if (!cards.length) {
         throw createToolError("ELEMENT_NOT_FOUND", "Не удалось найти карточки или структурированные блоки.", true);
     }
@@ -165,9 +178,84 @@ async function handleBrowserExtract(input) {
     };
 }
 
+async function handleBrowserScan(input) {
+    const limit = clamp(Number(input?.limit || 40), 1, 100);
+    const auth = detectAuthRequired();
+    const elements = collectInteractiveElements(limit);
+
+    return {
+        url: window.location.href,
+        title: document.title,
+        auth,
+        page_text: normalizeText(document.body?.innerText || "").slice(0, 4000),
+        elements,
+    };
+}
+
+async function handleBrowserAct(input) {
+    const action = String(input?.action || "").trim().toLowerCase();
+    const elementId = String(input?.element_id || "").trim();
+    const text = String(input?.text || "");
+    const key = String(input?.key || "Enter");
+
+    if (!action) {
+        throw createToolError("INTERNAL", "Не передан input.action.", false);
+    }
+
+    const beforeState = capturePageState();
+    const element = elementId ? scannedElements.get(elementId) || null : null;
+
+    switch (action) {
+        case "click": {
+            if (!element) {
+                throw createToolError("ELEMENT_NOT_FOUND", "Элемент для клика не найден.", false);
+            }
+            activateElement(element);
+            await wait(500);
+            break;
+        }
+        case "type": {
+            if (!element) {
+                throw createToolError("ELEMENT_NOT_FOUND", "Элемент для ввода не найден.", false);
+            }
+            focusAndReplace(element, text);
+            await wait(250);
+            break;
+        }
+        case "press": {
+            const target = element || document.activeElement;
+            if (!(target instanceof HTMLElement)) {
+                throw createToolError("ELEMENT_NOT_FOUND", "Не найден элемент для нажатия клавиши.", false);
+            }
+            dispatchKey(target, key);
+            await wait(300);
+            break;
+        }
+        default:
+            throw createToolError("INTERNAL", `Неизвестное действие: ${action}`, false);
+    }
+
+    const navigation = await waitForNavigationOrContentChange(beforeState, 1800);
+    if (navigation.changed) {
+        await waitForPageToSettle();
+    }
+
+    return {
+        action,
+        element_id: elementId || null,
+        navigation,
+        page: {
+            url: window.location.href,
+            title: document.title,
+            auth: detectAuthRequired(),
+        },
+    };
+}
+
 async function handleBrowserMessageDraft(input) {
     const target = String(input?.destination_hint || "").trim();
     const messageText = String(input?.message_text || "").trim();
+    const authState = detectAuthRequired();
 
     if (!target) {
         throw createToolError("INTERNAL", "Не передан destination_hint.", false);
@@ -175,6 +263,12 @@ async function handleBrowserMessageDraft(input) {
 
     if (!messageText) {
         throw createToolError("INTERNAL", "Не передан message_text.", false);
+    }
+
+    if (authState.required) {
+        throw createToolError("AUTH_REQUIRED", authState.message, false, {
+            site: window.location.hostname,
+        });
     }
 
     const diagnostics = [];
@@ -329,11 +423,41 @@ function inspectPage() {
     return {
         url: window.location.href,
         title: document.title,
+        auth: detectAuthRequired(),
         inputs: collectElementDiagnostics("input, textarea, [contenteditable='true'], [role='textbox']", 10),
         buttons: collectElementDiagnostics("button, [role='button']", 12),
         links: collectElementDiagnostics("a", 10),
         lists: collectElementDiagnostics("tr, li, article, div[role='listitem'], .message", 10),
     };
+}
+
+function detectAuthRequired() {
+    const href = window.location.href.toLowerCase();
+    if (/(login|signin|auth|oauth|passport)/i.test(href)) {
+        return {
+            required: true,
+            message: `Я не могу это сделать, пока вы не авторизуетесь на сайте ${window.location.hostname}.`,
+        };
+    }
+
+    const passwordField = findFirstVisible(["input[type='password']"]);
+    if (passwordField) {
+        return {
+            required: true,
+            message: `Я не могу это сделать, пока вы не авторизуетесь на сайте ${window.location.hostname}.`,
+        };
+    }
+
+    const loginButton = findButtonByText(["Войти", "Вход", "Log in", "Login", "Sign in"]);
+    const loginLink = findLinkByText(["Войти", "Вход", "Log in", "Login", "Sign in"]);
+    if (loginButton || loginLink) {
+        return {
+            required: true,
+            message: `Я не могу это сделать, пока вы не авторизуетесь на сайте ${window.location.hostname}.`,
+        };
+    }
+
+    return { required: false, message: "" };
 }
 
 function inspectVkSearchResults() {
@@ -353,6 +477,83 @@ function inspectVkSearchResults() {
     };
 }
 
+function collectInteractiveElements(limit) {
+    scannedElements.clear();
+    let index = 0;
+    const seen = new Set();
+    const selectors = [
+        "input",
+        "textarea",
+        "[contenteditable='true']",
+        "[role='textbox']",
+        "button",
+        "a[href]",
+        "[role='button']",
+        "[role='menuitem']",
+        "[role='option']",
+        "[tabindex]",
+    ];
+
+    const elements = [];
+    for (const selector of selectors) {
+        for (const element of document.querySelectorAll(selector)) {
+            if (!(element instanceof HTMLElement) || !isVisible(element)) {
+                continue;
+            }
+
+            const fingerprint = [
+                element.tagName,
+                element.id,
+                element.getAttribute("role") || "",
+                normalizeText(element.innerText || element.value || element.getAttribute("aria-label") || ""),
+                element.getAttribute("placeholder") || "",
+            ].join("|");
+
+            if (seen.has(fingerprint)) {
+                continue;
+            }
+            seen.add(fingerprint);
+
+            index += 1;
+            const elementId = `el_${index}`;
+            scannedElements.set(elementId, element);
+            elements.push({
+                element_id: elementId,
+                tag: element.tagName.toLowerCase(),
+                role: element.getAttribute("role") || "",
+                text: normalizeText(element.innerText || element.value || element.getAttribute("aria-label") || "").slice(0, 200),
+                placeholder: (element.getAttribute("placeholder") || "").slice(0, 120),
+                aria_label: (element.getAttribute("aria-label") || "").slice(0, 120),
+                href: element.getAttribute("href") || "",
+                clickable: isClickableElement(element),
+                typeable: isTypeableElement(element),
+            });
+
+            if (elements.length >= limit) {
+                return elements;
+            }
+        }
+    }
+
+    return elements;
+}
+
+function isClickableElement(element) {
+    const tag = element.tagName.toLowerCase();
+    return (
+        tag === "button" ||
+        tag === "a" ||
+        element.getAttribute("role") === "button" ||
+        element.getAttribute("role") === "menuitem" ||
+        element.getAttribute("role") === "option" ||
+        element.hasAttribute("tabindex")
+    );
+}
+
+function isTypeableElement(element) {
+    return isTextInput(element) || element.isContentEditable || element.getAttribute("role") === "textbox";
+}
+
 function collectSearchResults(selectors, limit) {
     const items = [];
 
@@ -366,7 +567,12 @@ function collectSearchResults(selectors, limit) {
             const url = link?.href || "";
             const snippet = normalizeText(snippetNode?.innerText || "");
 
-            if (title && url && !items.some((item) => item.url === url)) {
+            if (
+                title &&
+                url &&
+                !isSearchResultGarbage(title, url, snippet) &&
+                !items.some((item) => item.url === url)
+            ) {
                 items.push({ title, url, snippet });
             }
 
@@ -379,8 +585,29 @@ function collectSearchResults(selectors, limit) {
     return items;
 }
 
+function isSearchResultGarbage(title, url, snippet) {
+    const fullText = `${title} ${snippet}`.toLowerCase();
+    if (!/^https?:\/\//i.test(url)) {
+        return true;
+    }
+    if (/yandex\.ru\/an\/count/i.test(url)) {
+        return true;
+    }
+    if (fullText.includes("может заинтересовать")) {
+        return true;
+    }
+    if (fullText.includes("реклама")) {
+        return true;
+    }
+    return false;
+}
+
 function collectCandidateCards(limit) {
     const selectors = [
+        "[data-testid*='tile']",
+        "[data-testid*='item']",
+        "[data-widget*='searchResults'] [href]",
+        "[class*='tile']",
         "[data-testid*='product']",
         "[class*='product']",
         "[class*='Product']",
@@ -391,7 +618,22 @@ function collectCandidateCards(limit) {
 
     for (const selector of selectors) {
         const nodes = Array.from(document.querySelectorAll(selector))
-            .filter((node) => isVisible(node) && normalizeText(node.innerText).length > 20)
+            .filter((node) => {
+                if (!isVisible(node)) {
+                    return false;
+                }
+                const text = normalizeText(node.innerText);
+                if (text.length <= 20) {
+                    return false;
+                }
+                const anchors = node.matches("a[href]") ? [node] : Array.from(node.querySelectorAll("a[href]"));
+                return anchors.length > 0 || /\d/.test(text);
+            })
+            .sort((a, b) => {
+                const aScore = scoreCardCandidate(a);
+                const bScore = scoreCardCandidate(b);
+                return bScore - aScore;
+            })
             .slice(0, limit);
 
         if (nodes.length) {
@@ -405,7 +647,7 @@ function collectCandidateCards(limit) {
 function extractFieldsFromCard(card, fields) {
     const titleNode = card.querySelector("h1, h2, h3, [itemprop='name'], a");
     const priceNode = card.querySelector("[class*='price'], [data-testid*='price'], [itemprop='price']");
-    const linkNode = card.querySelector("a[href]");
+    const linkNode = selectBestLink(card);
     const rawText = normalizeText(card.innerText);
 
     const item = {};
@@ -542,6 +784,7 @@ async function tryActivateVkSearchResult(target, searchInput, diagnostics) {
     if (resultNode) {
         const clickable = getClickableTarget(resultNode);
         activateElement(clickable);
+        await wait(350);
         diagnostics.push(`VK-результат поиска найден и активирован (${describeElement(clickable)}).`);
     } else {
         diagnostics.push("VK-результат внутри списка диалогов не найден.");
@@ -549,6 +792,15 @@ async function tryActivateVkSearchResult(target, searchInput, diagnostics) {
     }
 
     let navigationState = await waitForNavigationOrContentChange(beforeState, 1800);
+    if (!navigationState.changed) {
+        const selectedResult = findVkPrimarySearchResultButton(target, searchInput);
+        if (selectedResult) {
+            activateElement(selectedResult);
+            diagnostics.push(`VK fallback: повторно активирую SearchResult (${describeElement(selectedResult)}).`);
+            await wait(350);
+            navigationState = await waitForNavigationOrContentChange(beforeState, 1800);
+        }
+    }
     if (!navigationState.changed) {
         const popupResult = findVkPopupResult(target, searchInput);
         if (popupResult) {
@@ -1044,9 +1296,9 @@ function findElementByText(text) {
 
 function getClickableTarget(element) {
     if (window.location.hostname.includes("vk.com")) {
-        const preciseVkTarget = element.matches?.("a[href*='sel='], a[href*='/im?'], [role='option'], [tabindex], .ConvoList__item, .VirtualScrollItem")
+        const preciseVkTarget = element.matches?.("button.SearchResult, .SearchResult, a[href*='sel='], a[href*='/im?'], [role='menuitem'], [role='option'], [tabindex], .ConvoList__item, .VirtualScrollItem")
             ? element
-            : element.querySelector?.("a[href*='sel='], a[href*='/im?'], [role='option'], [tabindex], .ConvoList__item, .VirtualScrollItem");
+            : element.querySelector?.("button.SearchResult, .SearchResult, a[href*='sel='], a[href*='/im?'], [role='menuitem'], [role='option'], [tabindex], .ConvoList__item, .VirtualScrollItem");
         if (preciseVkTarget && isVisible(preciseVkTarget)) {
             return preciseVkTarget;
         }
@@ -1109,6 +1361,91 @@ function findButtonByText(labels) {
     );
 }
 
+function scoreCardCandidate(card) {
+    const text = normalizeText(card.innerText);
+    const anchors = card.matches("a[href]") ? [card] : Array.from(card.querySelectorAll("a[href]"));
+    const price = parseFloat(parsePrice(text) || "0");
+    let score = Math.min(text.length, 200);
+    if (anchors.length) {
+        score += 50;
+    }
+    if (price > 0) {
+        score += 80;
+    }
+    if (/iphone|samsung|xiaomi|apple/i.test(text)) {
+        score += 40;
+    }
+    return score;
+}
+
+function selectBestLink(card) {
+    const currentUrl = new URL(window.location.href);
+    const anchors = (card.matches("a[href]") ? [card] : Array.from(card.querySelectorAll("a[href]")))
+        .filter((anchor) => isVisible(anchor))
+        .map((anchor) => ({
+            anchor,
+            href: anchor.href || "",
+            text: normalizeText(anchor.innerText || anchor.getAttribute("aria-label") || ""),
+        }))
+        .filter((item) => /^https?:\/\//i.test(item.href));
+
+    if (!anchors.length) {
+        return null;
+    }
+
+    anchors.sort((left, right) => scoreLinkCandidate(right, currentUrl) - scoreLinkCandidate(left, currentUrl));
+    return anchors[0].anchor;
+}
+
+function scoreLinkCandidate(item, currentUrl) {
+    let score = 0;
+    try {
+        const candidate = new URL(item.href);
+        if (candidate.origin === currentUrl.origin) {
+            score += 20;
+        }
+        if (candidate.pathname !== currentUrl.pathname) {
+            score += 40;
+        }
+        if (/\/product\/|\/item\/|\/goods\/|\/catalog\/|\/sale\/|\/offer\//i.test(candidate.pathname)) {
+            score += 120;
+        }
+        if (/\/category\/|\/search\/|\/brand\/|\/cars\/[^/]+\/[^/]+\/\d+\/(used|all|new)(\/do-\d+)?\/?$/i.test(candidate.pathname)) {
+            score -= 80;
+        }
+        if (candidate.search && !/sku|product|item/i.test(candidate.search)) {
+            score -= 10;
+        }
+        if (candidate.pathname.split("/").length > currentUrl.pathname.split("/").length) {
+            score += 15;
+        }
+    } catch (_error) {
+        score -= 100;
+    }
+
+    score += Math.min(item.text.length, 80);
+    if (/iphone|samsung|xiaomi|apple/i.test(item.text)) {
+        score += 30;
+    }
+    return score;
+}
+
+function findLinkByText(labels) {
+    const lowerLabels = labels.map((label) => label.toLowerCase());
+    const links = Array.from(document.querySelectorAll("a[href]"));
+
+    return (
+        links.find((link) => {
+            if (!isVisible(link)) {
+                return false;
+            }
+
+            const content = normalizeText(link.innerText).toLowerCase();
+            return lowerLabels.includes(content);
+        }) || null
+    );
+}
+
 function focusAndReplace(element, value) {
     element.focus();
 
@@ -1147,7 +1484,14 @@ function dispatchKey(element, key) {
 }
 
 function activateElement(element) {
+    element.scrollIntoView?.({ block: "center", inline: "center" });
     element.focus?.();
+
+    try {
+        element.click?.();
+    } catch (_error) {
+        // Fall through to synthetic events below.
+    }
 
     for (const eventName of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
         element.dispatchEvent(
@@ -1157,6 +1501,27 @@ function activateElement(element) {
                 view: window,
             })
         );
+    }
+
+    if (element.matches?.("button, [role='button'], [role='menuitem'], [tabindex]")) {
+        for (const key of ["Enter", " "]) {
+            element.dispatchEvent(
+                new KeyboardEvent("keydown", {
+                    key,
+                    code: key === " " ? "Space" : key,
+                    bubbles: true,
+                    cancelable: true,
+                })
+            );
+            element.dispatchEvent(
+                new KeyboardEvent("keyup", {
+                    key,
+                    code: key === " " ? "Space" : key,
+                    bubbles: true,
+                    cancelable: true,
+                })
+            );
+        }
     }
 }
 
