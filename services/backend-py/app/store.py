@@ -488,9 +488,22 @@ def tokenize_product_query(query: str, site_url: str | None = None) -> list[str]
     return [token for token in tokens if len(token) >= 2 and token not in stop_words]
 
 
+def normalize_storage_unit(unit: str) -> str:
+    lowered = (unit or "").lower()
+    if lowered in {"гб", "gb"}:
+        return "gb"
+    if lowered in {"тб", "tb"}:
+        return "tb"
+    return lowered
+
+
 def normalize_product_text(value: str) -> str:
     lowered = (value or "").lower()
-    lowered = re.sub(r"(\d+)\s*(gb|гб|tb|тб)\b", r"\1\2", lowered)
+    lowered = re.sub(
+        r"(\d+)\s*(gb|гб|tb|тб)\b",
+        lambda match: f"{match.group(1)}{normalize_storage_unit(match.group(2))}",
+        lowered,
+    )
     lowered = re.sub(r"[^a-zа-я0-9]+", " ", lowered)
     return re.sub(r"\s+", " ", lowered).strip()
 
@@ -499,7 +512,7 @@ def extract_storage_tokens(query: str, site_url: str | None = None) -> list[str]
     refined = refine_product_search_query(query, site_url, include_negative_variants=False).lower()
     compact = re.sub(r"\s+", "", refined)
     tokens = re.findall(r"(\d+)(gb|гб|tb|тб)\b", compact)
-    return [f"{number}{unit}" for number, unit in tokens]
+    return [f"{number}{normalize_storage_unit(unit)}" for number, unit in tokens]
 
 
 def extract_model_number_tokens(query: str, site_url: str | None = None) -> list[str]:
@@ -733,6 +746,35 @@ def score_product_match(product: ProductItem, query: str, site_url: str | None =
     for token in extract_model_number_tokens(query, site_url):
         if token in haystack:
             score += 5
+    return score
+
+
+def score_product_match_loose(product: ProductItem, query: str, site_url: str | None = None) -> int:
+    haystack = normalize_product_text(f"{product.title} {product.url}")
+    score = 0
+
+    for token in tokenize_product_query(query, site_url):
+        if token in haystack:
+            score += 1
+    for token in extract_storage_tokens(query, site_url):
+        if token in haystack:
+            score += 3
+    for token in extract_model_number_tokens(query, site_url):
+        if token in haystack:
+            score += 5
+
+    forbidden_variants = forbidden_variant_tokens(query)
+    haystack_words = set(haystack.split())
+    if forbidden_variants and any(token in haystack_words for token in forbidden_variants):
+        return -1000
+
+    requested_variants = query_variant_tokens(query, site_url)
+    if requested_variants and not requested_variants.issubset(haystack_words):
+        score -= 4
+
+    if not product_condition_matches_query(product, query):
+        score -= 5
+
     return score
 
 
@@ -1276,6 +1318,8 @@ class TaskStore:
                 return resp, None
             last_resp = resp if isinstance(resp, dict) else None
             last_err = err
+            if attempt < attempts:
+                time.sleep(0.6 * attempt)
         return last_resp, last_err
 
     def _find_and_open_best_result_any_site(
@@ -1764,7 +1808,7 @@ class TaskStore:
         current_url: str,
     ) -> list[ProductItem]:
         priced_items: list[ProductItem] = []
-        for _attempt in range(3):
+        for attempt in range(1, 4):
             extract_resp, extract_err = self._call_tool_with_error(
                 trace=trace,
                 trace_id=trace_id,
@@ -1780,10 +1824,14 @@ class TaskStore:
                 },
             )
             if extract_err is not None or not isinstance(extract_resp, dict):
+                if attempt < 3:
+                    time.sleep(0.8 * attempt)
                 continue
 
             items = extract_resp.get("output", {}).get("items", [])
             if not isinstance(items, list):
+                if attempt < 3:
+                    time.sleep(0.8 * attempt)
                 continue
 
             normalized_items: list[ProductItem] = []
@@ -1800,6 +1848,14 @@ class TaskStore:
                     continue
                 normalized_items.append(product)
 
+            self._append_trace(
+                trace,
+                "listing_extract_items_seen",
+                "ok",
+                "ranker",
+                detail=f"attempt={attempt} raw={len(items)} normalized={len(normalized_items)}",
+            )
+
             priced_items = [
                 item
                 for item in normalized_items
@@ -1810,7 +1866,35 @@ class TaskStore:
                 and price_within_requested_bounds(item, query)
             ]
             if priced_items:
+                self._append_trace(
+                    trace,
+                    "listing_extract_matches_found",
+                    "ok",
+                    "ranker",
+                    detail=f"attempt={attempt} matches={len(priced_items)}",
+                )
+            if priced_items:
                 break
+            loose_items = [
+                item
+                for item in normalized_items
+                if item.price is not None
+                and float(item.price or 0) > 0
+                and score_product_match_loose(item, query) > 0
+                and price_within_requested_bounds(item, query)
+            ]
+            if loose_items:
+                self._append_trace(
+                    trace,
+                    "listing_extract_loose_matches_found",
+                    "fallback",
+                    "ranker",
+                    detail=f"attempt={attempt} matches={len(loose_items)}",
+                )
+                priced_items = loose_items
+                break
+            if attempt < 3:
+                time.sleep(0.8 * attempt)
         return priced_items
 
     def _open_best_listing_candidate_from_scan(
@@ -1856,11 +1940,21 @@ class TaskStore:
             )
             score = score_product_match(candidate, query)
             if score <= 0:
+                score = score_product_match_loose(candidate, query)
+            if score <= 0:
                 continue
             if absolute_href and is_listing_url(absolute_href):
                 continue
             price_rank = float(candidate.price) if candidate.price is not None else 10**12
             evaluated.append((score, price_rank, element, candidate))
+
+        self._append_trace(
+            trace,
+            "listing_scan_candidates_seen",
+            "ok",
+            "ranker",
+            detail=f"elements={len(elements)} matched={len(evaluated)}",
+        )
 
         if not evaluated:
             return session_id, None

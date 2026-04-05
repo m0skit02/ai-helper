@@ -8,7 +8,8 @@ from fastapi.testclient import TestClient
 
 from app.llm_client import LLMClientError
 from app.main import app, store
-from app.store import extract_message_destination
+from app.schemas import ProductItem
+from app.store import extract_message_destination, product_matches_query
 from app.tools_client import ToolsClientError
 
 
@@ -557,6 +558,16 @@ def test_extract_message_destination_handles_vk_before_recipient() -> None:
 def test_extract_message_destination_handles_vk_after_recipient() -> None:
     destination = extract_message_destination('Отправь сообщение Павлу Борисову во ВКонтакте: Привет')
     assert destination == "Павлу Борисову"
+
+
+def test_product_matches_query_normalizes_storage_units_between_gb_and_gb_cyrillic() -> None:
+    product = ProductItem(
+        title="Apple iPhone 15 256 ГБ, черный",
+        url="https://www.ozon.ru/product/apple-iphone-15-256gb-black-111111/",
+        price=84990,
+        currency="RUB",
+    )
+    assert product_matches_query(product, "site:ozon.ru новый iphone 15 256 gb -max -mini -plus -pro -ultra", "https://www.ozon.ru/")
 
 
 def test_rule_plan_trace_for_supported_request(client: TestClient) -> None:

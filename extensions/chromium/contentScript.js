@@ -698,6 +698,79 @@ function collectInteractiveElements(limit) {
     scannedElements.clear();
     let index = 0;
     const seen = new Set();
+    const elements = [];
+
+    function pushScannedElement(element, payload = {}) {
+        if (!(element instanceof HTMLElement) || !isVisible(element)) {
+            return false;
+        }
+
+        const normalizedText = normalizeText(
+            payload.text || element.innerText || element.value || element.getAttribute("aria-label") || "",
+        );
+        const placeholder = String(payload.placeholder || element.getAttribute("placeholder") || "").slice(0, 120);
+        const ariaLabel = String(payload.aria_label || element.getAttribute("aria-label") || "").slice(0, 120);
+        const href = String(
+            payload.href
+            || element.getAttribute("href")
+            || element.closest?.("a[href]")?.getAttribute("href")
+            || "",
+        );
+
+        const fingerprint = [
+            element.tagName,
+            element.id,
+            element.getAttribute("role") || "",
+            normalizedText,
+            placeholder,
+            href,
+        ].join("|");
+
+        if (seen.has(fingerprint)) {
+            return false;
+        }
+        seen.add(fingerprint);
+
+        index += 1;
+        const elementId = `el_${index}`;
+        scannedElements.set(elementId, element);
+        elements.push({
+            element_id: elementId,
+            tag: String(payload.tag || element.tagName || "").toLowerCase(),
+            role: String(payload.role || element.getAttribute("role") || ""),
+            text: normalizedText.slice(0, 200),
+            placeholder,
+            aria_label: ariaLabel,
+            href,
+            clickable: payload.clickable ?? isClickableElement(element),
+            typeable: payload.typeable ?? isTypeableElement(element),
+        });
+        return true;
+    }
+
+    for (const card of collectCandidateCards(limit)) {
+        const clickable = selectBestLink(card) || getClickableTarget(card);
+        if (!(clickable instanceof HTMLElement)) {
+            continue;
+        }
+        const cardText = normalizeText(card.innerText || clickable.innerText || clickable.getAttribute("aria-label") || "");
+        const cardHref = clickable.getAttribute("href") || clickable.closest?.("a[href]")?.getAttribute("href") || "";
+        if (cardText.length <= 20) {
+            continue;
+        }
+        pushScannedElement(clickable, {
+            text: cardText,
+            href: cardHref,
+            clickable: true,
+            typeable: false,
+            tag: clickable.tagName.toLowerCase(),
+            role: clickable.getAttribute("role") || "",
+        });
+        if (elements.length >= limit) {
+            return elements;
+        }
+    }
+
     const selectors = [
         "input",
         "textarea",
@@ -711,41 +784,11 @@ function collectInteractiveElements(limit) {
         "[tabindex]",
     ];
 
-    const elements = [];
     for (const selector of selectors) {
         for (const element of document.querySelectorAll(selector)) {
-            if (!(element instanceof HTMLElement) || !isVisible(element)) {
+            if (!pushScannedElement(element)) {
                 continue;
             }
-
-            const fingerprint = [
-                element.tagName,
-                element.id,
-                element.getAttribute("role") || "",
-                normalizeText(element.innerText || element.value || element.getAttribute("aria-label") || ""),
-                element.getAttribute("placeholder") || "",
-            ].join("|");
-
-            if (seen.has(fingerprint)) {
-                continue;
-            }
-            seen.add(fingerprint);
-
-            index += 1;
-            const elementId = `el_${index}`;
-            scannedElements.set(elementId, element);
-            elements.push({
-                element_id: elementId,
-                tag: element.tagName.toLowerCase(),
-                role: element.getAttribute("role") || "",
-                text: normalizeText(element.innerText || element.value || element.getAttribute("aria-label") || "").slice(0, 200),
-                placeholder: (element.getAttribute("placeholder") || "").slice(0, 120),
-                aria_label: (element.getAttribute("aria-label") || "").slice(0, 120),
-                href: element.getAttribute("href") || "",
-                clickable: isClickableElement(element),
-                typeable: isTypeableElement(element),
-            });
-
             if (elements.length >= limit) {
                 return elements;
             }
@@ -834,11 +877,31 @@ function collectCandidateCards(limit) {
     ];
 
     for (const selector of selectors) {
+        const seen = new Set();
         const nodes = Array.from(document.querySelectorAll(selector))
+            .map((node) => {
+                if (!(node instanceof HTMLElement)) {
+                    return null;
+                }
+                const container = node.matches("a[href]") ? findCardContainer(node) : node;
+                if (!(container instanceof HTMLElement)) {
+                    return null;
+                }
+                return container;
+            })
             .filter((node) => {
-                if (!isVisible(node)) {
+                if (!(node instanceof HTMLElement) || !isVisible(node)) {
                     return false;
                 }
+                const fingerprint = [
+                    node.tagName,
+                    node.id || "",
+                    normalizeText(node.innerText).slice(0, 160),
+                ].join("|");
+                if (seen.has(fingerprint)) {
+                    return false;
+                }
+                seen.add(fingerprint);
                 const text = normalizeText(node.innerText);
                 if (text.length <= 20) {
                     return false;
@@ -858,7 +921,97 @@ function collectCandidateCards(limit) {
         }
     }
 
+    const currentUrl = new URL(window.location.href);
+    const fallbackCards = [];
+    const seen = new Set();
+    const anchors = Array.from(document.querySelectorAll("a[href]"))
+        .filter((anchor) => anchor instanceof HTMLElement)
+        .map((anchor) => ({
+            anchor,
+            href: anchor.href || "",
+            container: findCardContainer(anchor),
+            text: normalizeText(
+                findCardContainer(anchor)?.innerText
+                || anchor.innerText
+                || anchor.getAttribute("aria-label")
+                || anchor.getAttribute("title")
+                || "",
+            ),
+        }))
+        .filter((item) => /^https?:\/\//i.test(item.href))
+        .filter((item) => {
+            const container = item.container;
+            return isVisible(item.anchor) || (container instanceof HTMLElement && isVisible(container));
+        })
+        .sort((left, right) => scoreLinkCandidate(right, currentUrl) - scoreLinkCandidate(left, currentUrl));
+
+    for (const item of anchors) {
+        if (scoreLinkCandidate(item, currentUrl) < 60) {
+            continue;
+        }
+        const container = item.container;
+        if (!(container instanceof HTMLElement) || !isVisible(container)) {
+            continue;
+        }
+        const key = `${container.tagName}|${container.id || ""}|${normalizeText(container.innerText).slice(0, 120)}`;
+        if (seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+        fallbackCards.push(container);
+        if (fallbackCards.length >= limit) {
+            break;
+        }
+    }
+
+    if (fallbackCards.length) {
+        return fallbackCards;
+    }
+
     return [];
+}
+
+function findCardContainer(anchor) {
+    const selectors = [
+        "[data-testid*='tile']",
+        "[data-testid*='item']",
+        "[data-testid*='product']",
+        "[data-widget*='searchResults']",
+        "[class*='tile']",
+        "[class*='card']",
+        "[class*='Card']",
+        "[class*='item']",
+        "[class*='Item']",
+        "[class*='product']",
+        "[class*='Product']",
+        "article",
+        "li",
+    ];
+
+    for (const selector of selectors) {
+        const container = anchor.closest(selector);
+        if (container instanceof HTMLElement && isVisible(container)) {
+            const text = normalizeText(container.innerText);
+            if (text.length > 20) {
+                return container;
+            }
+        }
+    }
+
+    let current = anchor.parentElement;
+    let depth = 0;
+    while (current && depth < 6) {
+        if (isVisible(current)) {
+            const text = normalizeText(current.innerText);
+            if (text.length > 20 && (current.querySelectorAll("a[href]").length > 0 || /\d/.test(text))) {
+                return current;
+            }
+        }
+        current = current.parentElement;
+        depth += 1;
+    }
+
+    return anchor;
 }
 
 function extractFieldsFromCard(card, fields) {
@@ -892,8 +1045,23 @@ function extractFieldsFromCard(card, fields) {
 }
 
 function parsePrice(text) {
-    const match = String(text || "").replace(/\s+/g, "").match(/(\d+[.,]?\d*)/);
-    return match ? match[1].replace(",", ".") : "";
+    const normalized = String(text || "").replace(/\xa0/g, " ");
+    const currencyMatch = normalized.match(/(\d[\d\s]{2,}(?:[.,]\d+)?)\s*(?:₽|руб|р\b|rub)/i)
+        || normalized.match(/(?:₽|руб|р\b|rub)\s*(\d[\d\s]{2,}(?:[.,]\d+)?)/i);
+    if (currencyMatch) {
+        return currencyMatch[1].replace(/\s+/g, "").replace(",", ".");
+    }
+
+    const numericCandidates = Array.from(normalized.matchAll(/\b\d[\d\s]{3,}(?:[.,]\d+)?\b/g))
+        .map((match) => match[0].replace(/\s+/g, "").replace(",", "."))
+        .map((value) => Number.parseFloat(value))
+        .filter((value) => Number.isFinite(value) && value >= 1000);
+    if (numericCandidates.length) {
+        return String(Math.max(...numericCandidates));
+    }
+
+    const fallback = normalized.replace(/\s+/g, "").match(/(\d+[.,]?\d*)/);
+    return fallback ? fallback[1].replace(",", ".") : "";
 }
 
 function detectCurrency(text) {
@@ -2001,7 +2169,16 @@ function scoreCardCandidate(card) {
 function selectBestLink(card) {
     const currentUrl = new URL(window.location.href);
     const anchors = (card.matches("a[href]") ? [card] : Array.from(card.querySelectorAll("a[href]")))
-        .filter((anchor) => isVisible(anchor))
+        .filter((anchor) => {
+            if (!(anchor instanceof HTMLElement)) {
+                return false;
+            }
+            if (isVisible(anchor)) {
+                return true;
+            }
+            const content = normalizeText(anchor.innerText || anchor.getAttribute("aria-label") || anchor.getAttribute("title") || "");
+            return Boolean(anchor.href) && content.length > 0;
+        })
         .map((anchor) => ({
             anchor,
             href: anchor.href || "",
