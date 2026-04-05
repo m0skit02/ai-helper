@@ -207,6 +207,190 @@ class FakeToolsClientInformationalNoOpen(FakeToolsClient):
         return super().call_tool(tool=tool, session_id=session_id, input_data=input_data, trace_id=trace_id)
 
 
+class FakeToolsClientOzonCheapest:
+    def __init__(self) -> None:
+        self.current_url = ""
+        self.opened_urls: list[str] = []
+
+    def call_tool(
+        self,
+        tool: str,
+        session_id: str | None,
+        input_data: dict[str, Any],
+        trace_id: str,
+    ) -> dict[str, Any]:
+        if tool == "browser.open":
+            self.current_url = str(input_data.get("url", ""))
+            self.opened_urls.append(self.current_url)
+            return {
+                "trace_id": trace_id,
+                "session_id": session_id or "sess-ozon",
+                "tool": tool,
+                "ok": True,
+                "output": {"opened": True, "url": self.current_url, "tab_id": 1},
+                "error": None,
+                "duration_ms": 10,
+            }
+
+        if tool == "browser.search":
+            return {
+                "trace_id": trace_id,
+                "session_id": session_id or "sess-ozon",
+                "tool": tool,
+                "ok": True,
+                "output": {
+                    "results": [
+                        {
+                            "title": "Поиск Ozon: Apple iPhone 15 256 ГБ",
+                            "url": "https://www.ozon.ru/search/?text=iphone%2015%20256",
+                            "snippet": "listing",
+                        }
+                    ]
+                },
+                "error": None,
+                "duration_ms": 10,
+            }
+
+        if tool == "browser.extract":
+            schema_type = input_data.get("schema", {}).get("type")
+            if schema_type != "product":
+                return {
+                    "trace_id": trace_id,
+                    "session_id": session_id or "sess-ozon",
+                    "tool": tool,
+                    "ok": True,
+                    "output": {"items": []},
+                    "error": None,
+                    "duration_ms": 10,
+                }
+
+            if "/search/" in self.current_url:
+                return {
+                    "trace_id": trace_id,
+                    "session_id": session_id or "sess-ozon",
+                    "tool": tool,
+                    "ok": True,
+                    "output": {
+                        "items": [
+                            {
+                                "title": "Apple iPhone 15 256 ГБ, черный",
+                                "price": 84990,
+                                "currency": "RUB",
+                                "url": "https://www.ozon.ru/product/apple-iphone-15-256gb-black-111111/",
+                            },
+                            {
+                                "title": "Apple iPhone 15 Pro 256 ГБ, черный",
+                                "price": 80990,
+                                "currency": "RUB",
+                                "url": "https://www.ozon.ru/product/apple-iphone-15-pro-256gb-black-222222/",
+                            },
+                            {
+                                "title": "Apple iPhone 15 Mini 256 ГБ, черный",
+                                "price": 77990,
+                                "currency": "RUB",
+                                "url": "https://www.ozon.ru/product/apple-iphone-15-mini-256gb-black-333333/",
+                            },
+                        ]
+                    },
+                    "error": None,
+                    "duration_ms": 10,
+                }
+
+            return {
+                "trace_id": trace_id,
+                "session_id": session_id or "sess-ozon",
+                "tool": tool,
+                "ok": True,
+                "output": {
+                    "items": [
+                        {
+                            "title": "Apple iPhone 15 256 ГБ, черный",
+                            "price": 84990,
+                            "currency": "RUB",
+                            "url": self.current_url,
+                        }
+                    ]
+                },
+                "error": None,
+                "duration_ms": 10,
+            }
+
+        if tool == "browser.scan":
+            return {
+                "trace_id": trace_id,
+                "session_id": session_id or "sess-ozon",
+                "tool": tool,
+                "ok": True,
+                "output": {"elements": [], "url": self.current_url},
+                "error": None,
+                "duration_ms": 10,
+            }
+
+        raise AssertionError(f"unexpected tool {tool}")
+
+
+class FakeToolsClientOzonScanFallback(FakeToolsClientOzonCheapest):
+    def call_tool(
+        self,
+        tool: str,
+        session_id: str | None,
+        input_data: dict[str, Any],
+        trace_id: str,
+    ) -> dict[str, Any]:
+        if tool == "browser.extract" and "/search/" in self.current_url:
+            return {
+                "trace_id": trace_id,
+                "session_id": session_id or "sess-ozon",
+                "tool": tool,
+                "ok": True,
+                "output": {"items": []},
+                "error": None,
+                "duration_ms": 10,
+            }
+
+        if tool == "browser.scan" and "/search/" in self.current_url:
+            return {
+                "trace_id": trace_id,
+                "session_id": session_id or "sess-ozon",
+                "tool": tool,
+                "ok": True,
+                "output": {
+                    "url": self.current_url,
+                    "title": "Ozon Search",
+                    "auth": {"required": False},
+                    "page_text": "",
+                    "elements": [
+                        {
+                            "element_id": "el_1",
+                            "tag": "a",
+                            "role": "",
+                            "text": "Apple iPhone 15 256 ГБ, черный 84 990 ₽",
+                            "placeholder": "",
+                            "aria_label": "",
+                            "href": "https://www.ozon.ru/product/apple-iphone-15-256gb-black-111111/",
+                            "clickable": True,
+                            "typeable": False,
+                        },
+                        {
+                            "element_id": "el_2",
+                            "tag": "a",
+                            "role": "",
+                            "text": "Apple iPhone 15 Pro 256 ГБ, черный 80 990 ₽",
+                            "placeholder": "",
+                            "aria_label": "",
+                            "href": "https://www.ozon.ru/product/apple-iphone-15-pro-256gb-black-222222/",
+                            "clickable": True,
+                            "typeable": False,
+                        },
+                    ],
+                },
+                "error": None,
+                "duration_ms": 10,
+            }
+
+        return super().call_tool(tool=tool, session_id=session_id, input_data=input_data, trace_id=trace_id)
+
+
 class FakeNewsClient:
     def enabled(self) -> bool:
         return True
@@ -528,3 +712,49 @@ def test_news_prompt_uses_non_browser_news_layer_with_links_in_chat(client: Test
     assert "stub summary" in assistant_message
     assert "Ссылки:" in assistant_message
     assert "https://example.com/ev-news-1" in assistant_message
+
+
+def test_marketplace_product_query_opens_cheapest_matching_ozon_card(client: TestClient) -> None:
+    tools_client = FakeToolsClientOzonCheapest()
+    store.reset_for_tests(tools_client=tools_client, llm_client=None)
+
+    conv = client.post("/chat/conversations", json={"title": "Products"}).json()
+    cid = conv["conversation_id"]
+
+    created = client.post(
+        f"/chat/conversations/{cid}/messages",
+        json={"content": "site:ozon.ru новый iphone 15 256 gb -max -mini -plus -pro -ultra", "allow_social_actions": True},
+    )
+    assert created.status_code == 200
+
+    task = wait_for_task(client, created.json()["task"]["task_id"])
+    assert task["status"] == "done"
+    assert task["error"] is None
+    assert [item for item in task["trace"] if item["step"] == "marketplace_product_short_circuit"]
+    assert [item for item in task["trace"] if item["step"] == "llm_navigation_plan_ok"] == []
+    assert task["result"]["product"]["url"] == "https://www.ozon.ru/product/apple-iphone-15-256gb-black-111111/"
+    assert [item for item in task["trace"] if item["step"] == "marketplace_native_search_selected"]
+    assert [item for item in task["trace"] if "browser.search" in item["step"]] == []
+    assert tools_client.opened_urls[0] == "https://www.ozon.ru/search/?text=%D0%BD%D0%BE%D0%B2%D1%8B%D0%B9+iphone+15+256+gb"
+    assert tools_client.opened_urls[-1] == "https://www.ozon.ru/product/apple-iphone-15-256gb-black-111111/"
+
+
+def test_marketplace_product_query_uses_scan_fallback_without_external_search(client: TestClient) -> None:
+    tools_client = FakeToolsClientOzonScanFallback()
+    store.reset_for_tests(tools_client=tools_client, llm_client=None)
+
+    conv = client.post("/chat/conversations", json={"title": "Products Fallback"}).json()
+    cid = conv["conversation_id"]
+
+    created = client.post(
+        f"/chat/conversations/{cid}/messages",
+        json={"content": "site:ozon.ru новый iphone 15 256 gb -max -mini -plus -pro -ultra", "allow_social_actions": True},
+    )
+    assert created.status_code == 200
+
+    task = wait_for_task(client, created.json()["task"]["task_id"])
+    assert task["status"] == "done"
+    assert task["error"] is None
+    assert [item for item in task["trace"] if item["step"] == "listing_scan_candidate_opened"]
+    assert [item for item in task["trace"] if "browser.search" in item["step"]] == []
+    assert tools_client.opened_urls[-1] == "https://www.ozon.ru/product/apple-iphone-15-256gb-black-111111/"

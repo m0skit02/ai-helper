@@ -6,7 +6,7 @@ import traceback
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 from uuid import uuid4
 
 from .llm_client import LLMClient, LLMClientError
@@ -165,11 +165,36 @@ def infer_site_url(query: str) -> str | None:
 
 
 def build_search_url(query: str, engine: str = "yandex") -> str:
-    from urllib.parse import quote_plus
-
     if engine.lower() == "google":
         return f"https://www.google.com/search?q={quote_plus(query)}"
     return f"https://yandex.ru/search/?text={quote_plus(query)}"
+
+
+def build_native_site_search_url(site_url: str | None, query: str) -> str | None:
+    domain = extract_site_domain(site_url)
+    if not domain:
+        return None
+
+    compact_query = re.sub(r"(?i)(?:^|\s)-\s*(pro|max|plus|mini|ultra)\b", " ", query)
+    compact_query = re.sub(r"(?i)\b(?:без|not)\s+(pro|max|plus|mini|ultra)\b", " ", compact_query)
+    compact_query = re.sub(r"\s+", " ", compact_query).strip()
+    encoded_query = quote_plus(compact_query)
+
+    patterns = {
+        "ozon.ru": f"https://www.ozon.ru/search/?text={encoded_query}",
+        "wildberries.ru": f"https://www.wildberries.ru/catalog/0/search.aspx?search={encoded_query}",
+        "market.yandex.ru": f"https://market.yandex.ru/search?text={encoded_query}",
+        "megamarket.ru": f"https://megamarket.ru/catalog/?q={encoded_query}",
+        "sbermegamarket.ru": f"https://megamarket.ru/catalog/?q={encoded_query}",
+        "dns-shop.ru": f"https://www.dns-shop.ru/search/?q={encoded_query}",
+        "citilink.ru": f"https://www.citilink.ru/search/?text={encoded_query}",
+        "mvideo.ru": f"https://www.mvideo.ru/product-list-page?q={encoded_query}",
+        "eldorado.ru": f"https://www.eldorado.ru/search/catalog.php?q={encoded_query}",
+        "aliexpress.ru": f"https://aliexpress.ru/wholesale?SearchText={encoded_query}",
+    }
+    if domain in patterns:
+        return patterns[domain]
+    return None
 
 
 def requires_message_action_clean(query: str) -> bool:
@@ -334,8 +359,29 @@ def query_targets_marketplaces(query: str) -> bool:
         "marketplaces",
         "all stores",
         "all marketplaces",
+        "ozon",
+        "\u043e\u0437\u043e\u043d",
+        "wildberries",
+        "wb",
+        "yandex market",
+        "\u044f\u043d\u0434\u0435\u043a\u0441 \u043c\u0430\u0440\u043a\u0435\u0442",
+        "market.yandex",
+        "dns",
+        "\u0434\u043d\u0441",
+        "citilink",
+        "\u0441\u0438\u0442\u0438\u043b\u0438\u043d\u043a",
+        "mvideo",
+        "\u043c\u0432\u0438\u0434\u0435\u043e",
+        "eldorado",
+        "\u044d\u043b\u044c\u0434\u043e\u0440\u0430\u0434\u043e",
+        "megamarket",
+        "\u043c\u0435\u0433\u0430\u043c\u0430\u0440\u043a\u0435\u0442",
     )
     return any(marker in lowered for marker in markers)
+
+
+def has_explicit_site_constraint(query: str) -> bool:
+    return bool(re.search(r"(?i)\bsite:(?:www\.)?[a-z0-9.-]+\b", query or ""))
 
 
 def is_allowed_marketplace_domain(url: str) -> bool:
@@ -380,6 +426,7 @@ def refine_product_search_query(
         r"(?i)\bon ozon\b",
         r"(?i)\bна wildberries\b",
         r"(?i)\bon wildberries\b",
+        r"(?i)\bsite:(?:www\.)?[a-z0-9.-]+\b",
     )
     for pattern in cleanup_patterns:
         refined = re.sub(pattern, " ", refined)
@@ -391,10 +438,10 @@ def refine_product_search_query(
 
     refined = re.sub(r"\s+", " ", refined).strip(" ,.-")
 
-    raw_variant_tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]+", query.lower()))
-    requested_variants = {token for token in raw_variant_tokens if token in {"pro", "max", "plus", "mini", "ultra"}}
-    forbidden_variants = {"pro", "max", "plus", "mini", "ultra"} - requested_variants
-    negative_terms = [f"-{variant}" for variant in sorted(forbidden_variants)] if include_negative_variants and not requested_variants else []
+    requested_variants = query_variant_tokens(query, site_url)
+    forbidden_variants = forbidden_variant_tokens(query)
+    remaining_variants = {"pro", "max", "plus", "mini", "ultra"} - requested_variants - forbidden_variants
+    negative_terms = [f"-{variant}" for variant in sorted(remaining_variants)] if include_negative_variants and not requested_variants else []
 
     final_query = refined or query
     if negative_terms:
@@ -404,6 +451,7 @@ def refine_product_search_query(
 
 def tokenize_product_query(query: str, site_url: str | None = None) -> list[str]:
     refined = refine_product_search_query(query, site_url, include_negative_variants=False).lower()
+    refined = re.sub(r"(?i)(?:^|\s)-\s*(pro|max|plus|mini|ultra)\b", " ", refined)
     tokens = re.findall(r"[a-zA-Zа-яА-Я0-9]+", refined)
     stop_words = {
         "и",
@@ -417,6 +465,25 @@ def tokenize_product_query(query: str, site_url: str | None = None) -> list[str]
         "with",
         "ozon",
         "wildberries",
+        "site",
+        "www",
+        "ru",
+        "com",
+        "новый",
+        "новая",
+        "новое",
+        "new",
+        "найди",
+        "find",
+        "купить",
+        "цена",
+        "стоимость",
+        "price",
+        "дешевый",
+        "дешевую",
+        "дешевое",
+        "cheapest",
+        "lowest",
     }
     return [token for token in tokens if len(token) >= 2 and token not in stop_words]
 
@@ -440,10 +507,42 @@ def extract_model_number_tokens(query: str, site_url: str | None = None) -> list
     return [token for token in tokens if token.isdigit() and 10 <= int(token) <= 30]
 
 
+def forbidden_variant_tokens(query: str) -> set[str]:
+    lowered = query.lower()
+    forbidden = {
+        match.group(1)
+        for match in re.finditer(r"(?:^|\s)-\s*(pro|max|plus|mini|ultra)\b", lowered)
+    }
+    forbidden.update(
+        match.group(1)
+        for match in re.finditer(r"\b(?:без|not)\s+(pro|max|plus|mini|ultra)\b", lowered)
+    )
+    return forbidden
+
+
 def query_variant_tokens(query: str, site_url: str | None = None) -> set[str]:
-    tokens = set(tokenize_product_query(query, site_url))
+    sanitized = re.sub(r"(?i)(?:^|\s)-\s*(pro|max|plus|mini|ultra)\b", " ", query.lower())
+    sanitized = re.sub(r"(?i)\b(?:без|not)\s+(pro|max|plus|mini|ultra)\b", " ", sanitized)
+    sanitized = re.sub(r"(?i)\bsite:(?:www\.)?[a-z0-9.-]+\b", " ", sanitized)
+    tokens = set(re.findall(r"[a-zA-Zа-яА-Я0-9]+", sanitized))
     variants = {"pro", "max", "plus", "mini", "ultra"}
-    return {token for token in tokens if token in variants}
+    forbidden = forbidden_variant_tokens(query)
+    return {token for token in tokens if token in variants and token not in forbidden}
+
+
+def product_condition_matches_query(product: ProductItem, query: str) -> bool:
+    if not re.search(r"\b(новый|новая|новое|new)\b", query.lower()):
+        return True
+    haystack = normalize_product_text(f"{product.title} {product.condition or ''} {product.url}")
+    blocked_markers = (
+        "used",
+        "refurbished",
+        "бу",
+        "уцен",
+        "витрин",
+        "восстанов",
+    )
+    return not any(marker in haystack for marker in blocked_markers)
 
 
 def parse_price_bounds(query: str) -> tuple[float | None, float | None]:
@@ -474,6 +573,34 @@ def normalize_price_value(number: str | None, suffix: str | None) -> float | Non
     elif suffix in {"тыс", "k"}:
         value *= 1_000
     return value
+
+
+def extract_price_from_text(value: str) -> float | None:
+    normalized = (value or "").replace("\xa0", " ")
+    currency_patterns = (
+        r"(\d[\d\s]{2,}(?:[.,]\d+)?)\s*(?:₽|руб|р\b|rub)",
+        r"(?:₽|руб|р\b|rub)\s*(\d[\d\s]{2,}(?:[.,]\d+)?)",
+    )
+    for pattern in currency_patterns:
+        match = re.search(pattern, normalized, re.IGNORECASE)
+        if not match:
+            continue
+        candidate = match.group(1).replace(" ", "").replace(",", ".")
+        try:
+            return float(candidate)
+        except ValueError:
+            continue
+
+    numeric_candidates = re.findall(r"\b\d[\d\s]{3,}\b", normalized)
+    for raw in numeric_candidates:
+        candidate = raw.replace(" ", "")
+        try:
+            value_float = float(candidate)
+        except ValueError:
+            continue
+        if value_float >= 1000:
+            return value_float
+    return None
 
 
 def parse_price_bounds_v2(query: str) -> tuple[float | None, float | None]:
@@ -520,7 +647,14 @@ def product_matches_query(product: ProductItem, query: str, site_url: str | None
     if not query_tokens:
         return True
 
-    text_tokens = [token for token in query_tokens if token.isalpha() and token not in {"gb", "гб", "tb", "тб"}]
+    if not product_condition_matches_query(product, query):
+        return False
+
+    text_tokens = [
+        token
+        for token in query_tokens
+        if token.isalpha() and token not in {"gb", "гб", "tb", "тб", "pro", "max", "plus", "mini", "ultra"}
+    ]
     required_text = [token for token in text_tokens if token not in {"apple", "smartfon", "смартфон"}]
     if required_text and not all(token in haystack for token in required_text):
         return False
@@ -534,11 +668,34 @@ def product_matches_query(product: ProductItem, query: str, site_url: str | None
         return False
 
     requested_variants = query_variant_tokens(query, site_url)
-    forbidden_variants = {"pro", "max", "plus", "mini", "ultra"} - requested_variants
-    if not requested_variants and any(token in haystack.split() for token in forbidden_variants):
+    forbidden_variants = forbidden_variant_tokens(query)
+    haystack_words = set(haystack.split())
+    if requested_variants and not requested_variants.issubset(haystack_words):
+        return False
+    if forbidden_variants and any(token in haystack_words for token in forbidden_variants):
+        return False
+    if not requested_variants and not forbidden_variants and any(token in haystack_words for token in {"pro", "max", "plus", "mini", "ultra"}):
         return False
 
     return True
+
+
+def should_open_product_result(query: str, site_url: str | None = None) -> bool:
+    lowered = query.lower()
+    if re.search(r"\b(открой|перейди|покажи|open|go to)\b", lowered):
+        return True
+    if not wants_product_search_clean(query):
+        return False
+    return bool(site_url) or has_explicit_site_constraint(query) or query_targets_marketplaces(query)
+
+
+def prefers_lowest_price_product(query: str, site_url: str | None = None) -> bool:
+    lowered = query.lower()
+    if re.search(r"\b(дешев|cheap|lowest|min)\b", lowered):
+        return True
+    if not wants_product_search_clean(query):
+        return False
+    return has_explicit_site_constraint(query) or query_targets_marketplaces(query) or is_allowed_marketplace_domain(site_url or "")
 
 
 def search_result_matches_product_query(result: dict[str, Any], query: str, site_url: str | None = None) -> bool:
@@ -1321,6 +1478,30 @@ class TaskStore:
         if not domain:
             return "failed", session_id, "Я не смог определить сайт для поиска результата."
 
+        if wants_product_search_clean(query) and is_allowed_marketplace_domain(site_url):
+            listing_query = refine_product_search_query(search_query, site_url, include_negative_variants=False)
+            native_search_url = build_native_site_search_url(site_url, listing_query)
+            if native_search_url:
+                self._append_trace(trace, "marketplace_native_search_selected", "ok", "router", detail=domain)
+                session_id, cheapest_from_listing = self._open_listing_and_pick_best_product(
+                    query=query,
+                    trace=trace,
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    result=result,
+                    listing_url=native_search_url,
+                )
+                if cheapest_from_listing is not None:
+                    return "done", session_id, f"Открыл самый дешёвый найденный товар на сайте {domain}."
+                self._append_trace(
+                    trace,
+                    "marketplace_native_search_failed",
+                    "failed",
+                    "browser.open",
+                    detail=domain,
+                )
+                return "failed", session_id, f"Я открыл листинг на сайте {domain}, но не смог выбрать подходящую карточку товара."
+
         effective_search_query = search_query.strip()
         if wants_product_search_clean(query):
             effective_search_query = refine_product_search_query(search_query, site_url)
@@ -1632,6 +1813,105 @@ class TaskStore:
                 break
         return priced_items
 
+    def _open_best_listing_candidate_from_scan(
+        self,
+        query: str,
+        trace: list[TraceItem],
+        trace_id: str,
+        session_id: str | None,
+        result: TaskResult,
+        listing_url: str,
+    ) -> tuple[str | None, ProductItem | None]:
+        scan_resp, scan_err = self._scan_page_with_retry(
+            trace=trace,
+            trace_id=trace_id,
+            session_id=session_id,
+            limit=100,
+        )
+        if scan_err is not None or not isinstance(scan_resp, dict):
+            return session_id, None
+
+        page = scan_resp.get("output", {})
+        elements = page.get("elements", []) if isinstance(page, dict) else []
+        if not isinstance(elements, list):
+            return session_id, None
+
+        evaluated: list[tuple[int, float, dict[str, Any], ProductItem]] = []
+        for element in elements:
+            if not isinstance(element, dict) or not element.get("clickable"):
+                continue
+            element_id = str(element.get("element_id", "")).strip()
+            element_text = str(element.get("text", "") or element.get("aria_label", "") or "").strip()
+            href = str(element.get("href", "")).strip()
+            if not element_id or not element_text:
+                continue
+            if is_offer_list_trigger(element_text):
+                continue
+
+            absolute_href = urljoin(listing_url, href) if href else ""
+            candidate = ProductItem(
+                title=element_text,
+                url=absolute_href,
+                price=extract_price_from_text(element_text),
+            )
+            score = score_product_match(candidate, query)
+            if score <= 0:
+                continue
+            if absolute_href and is_listing_url(absolute_href):
+                continue
+            price_rank = float(candidate.price) if candidate.price is not None else 10**12
+            evaluated.append((score, price_rank, element, candidate))
+
+        if not evaluated:
+            return session_id, None
+
+        max_score = max(score for score, _price, _element, _candidate in evaluated)
+        strongest = [item for item in evaluated if item[0] == max_score]
+        _score, _price_rank, chosen_element, chosen_candidate = min(strongest, key=lambda item: item[1])
+
+        chosen_url = chosen_candidate.url.strip()
+        if chosen_url and is_probable_product_url(chosen_url):
+            open_resp, open_err = self._call_tool_with_error(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.open",
+                session_id=session_id,
+                input_data={"url": chosen_url, "activate": True},
+            )
+            if open_err is None and isinstance(open_resp, dict):
+                session_id = open_resp.get("session_id") or session_id
+                self._append_trace(trace, "listing_scan_candidate_opened", "ok", "browser.open", detail=chosen_url[:160])
+        else:
+            act_resp, act_err = self._call_tool_with_error(
+                trace=trace,
+                trace_id=trace_id,
+                tool="browser.act",
+                session_id=session_id,
+                input_data={"action": "click", "element_id": str(chosen_element.get("element_id", "")).strip()},
+            )
+            if act_err is not None or not isinstance(act_resp, dict):
+                return session_id, None
+            session_id = act_resp.get("session_id") or session_id
+            self._append_trace(trace, "listing_scan_candidate_clicked", "ok", "browser.act", detail=chosen_candidate.title[:160])
+
+        extracted = self._extract_products_from_current_page(
+            query=query,
+            trace=trace,
+            trace_id=trace_id,
+            session_id=session_id,
+            current_url=listing_url,
+        )
+        if extracted:
+            max_score = max(score_product_match(item, query) for item in extracted)
+            strongest_products = [item for item in extracted if score_product_match(item, query) == max_score]
+            chosen_product = min(strongest_products, key=lambda item: float(item.price or 0))
+        else:
+            chosen_product = chosen_candidate
+
+        result.product = chosen_product
+        result.sources = self._merge_sources([chosen_product.url], result.sources)
+        return session_id, chosen_product
+
     def _open_listing_and_pick_best_product(
         self,
         query: str,
@@ -1661,7 +1941,17 @@ class TaskStore:
             current_url=listing_url,
         )
         if not priced_items:
-            return session_id, None
+            session_id, scan_candidate = self._open_best_listing_candidate_from_scan(
+                query=query,
+                trace=trace,
+                trace_id=trace_id,
+                session_id=session_id,
+                result=result,
+                listing_url=listing_url,
+            )
+            if scan_candidate is None:
+                return session_id, None
+            return session_id, scan_candidate
 
         max_score = max(score_product_match(item, query) for item in priced_items)
         strongest = [item for item in priced_items if score_product_match(item, query) == max_score]
@@ -1689,6 +1979,25 @@ class TaskStore:
         session_id: str | None,
         result: TaskResult,
     ) -> tuple[str, str | None, str | None]:
+        site_url_hint = (resolve_site_url(query) or infer_site_url(query) or "").strip()
+        if wants_product_search_clean(query) and site_url_hint and is_allowed_marketplace_domain(site_url_hint):
+            self._append_trace(
+                trace,
+                "marketplace_product_short_circuit",
+                "ok",
+                "router",
+                detail=extract_site_domain(site_url_hint) or site_url_hint,
+            )
+            return self._find_and_open_best_site_result_v3(
+                query=query,
+                trace=trace,
+                trace_id=trace_id,
+                session_id=session_id,
+                result=result,
+                site_url=site_url_hint,
+                search_query=query,
+            )
+
         if self._llm is None or not self._llm.enabled():
             return (
                 "failed",
@@ -2356,7 +2665,7 @@ class TaskStore:
         wants_message = requires_message_action_clean(query)
         wants_news = wants_news_search(query)
         wants_product = wants_product_search_clean(query)
-        open_best_result = bool(
+        open_best_result = should_open_product_result(query, site_url) if wants_product else bool(
             re.search(r"\b(открой|перейди|покажи|open|go to)\b", lowered)
         )
         looks_bulk = wants_message and bool(
@@ -2407,7 +2716,7 @@ class TaskStore:
             "attributes": {},
             "ranking": {
                 "primary": "relevance",
-                "secondary": "price_asc" if wants_product and re.search(r"\b(дешев|cheap|lowest|min)\b", lowered) else None,
+                "secondary": "price_asc" if wants_product and prefers_lowest_price_product(query, site_url) else None,
             },
             "action": {
                 "open_best_result": open_best_result,
@@ -2474,10 +2783,22 @@ class TaskStore:
         if intent == "news_summary" and not is_open_site_request_clean(query):
             normalized["request_route"] = "informational_request"
 
+        if intent == "find_product":
+            action_payload = normalized["action"] if isinstance(normalized["action"], dict) else {}
+            if should_open_product_result(query, site_url):
+                action_payload["open_best_result"] = True
+                normalized["request_route"] = "browser_action_request"
+            normalized["action"] = action_payload
+
+            ranking_payload = normalized["ranking"] if isinstance(normalized["ranking"], dict) else {}
+            if prefers_lowest_price_product(query, site_url):
+                ranking_payload["secondary"] = "price_asc"
+            normalized["ranking"] = ranking_payload
+
         normalized["wants_product"] = intent == "find_product"
         normalized["wants_news"] = intent == "news_summary"
         normalized["wants_message"] = intent in {"send_message", "bulk_message"}
-        normalized["supports_browser_action"] = request_route == "browser_action_request"
+        normalized["supports_browser_action"] = normalized["request_route"] == "browser_action_request"
         return normalized
 
     def _plan_query(self, query: str, trace: list[TraceItem]) -> dict[str, Any]:
