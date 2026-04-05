@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from .llm_client import LLMClient, LLMClientError
+from .news_client import NewsClient, NewsClientError
 from .schemas import (
     ActionConfirmRequest,
     ActionItem,
@@ -685,6 +686,7 @@ class TaskStore:
         self,
         tools_client: ToolsClient | None = None,
         llm_client: LLMClient | None = None,
+        news_client: NewsClient | None = None,
     ) -> None:
         self._lock = Lock()
         self._tasks: dict[str, TaskResponse] = {}
@@ -692,6 +694,7 @@ class TaskStore:
         self._messages: dict[str, list[MessageItem]] = {}
         self._tools = tools_client
         self._llm = llm_client
+        self._news = news_client
 
     def _empty_result(self) -> TaskResult:
         return TaskResult(
@@ -705,6 +708,7 @@ class TaskStore:
         self,
         tools_client: ToolsClient | None = None,
         llm_client: LLMClient | None = None,
+        news_client: NewsClient | None = None,
     ) -> None:
         with self._lock:
             self._tasks.clear()
@@ -712,6 +716,7 @@ class TaskStore:
             self._messages.clear()
             self._tools = tools_client
             self._llm = llm_client
+            self._news = news_client
 
     def _append_trace(
         self,
@@ -869,6 +874,33 @@ class TaskStore:
         )
         result.sources = self._merge_sources([site_url], result.sources)
         return "needs_confirmation", session_id, None
+
+    def _run_non_browser_news_retrieval(
+        self,
+        query: str,
+        trace: list[TraceItem],
+        result: TaskResult,
+    ) -> str | None:
+        if self._news is None or not self._news.enabled():
+            self._append_trace(trace, "news_layer_skipped", "fallback", "news.layer")
+            return None
+
+        try:
+            raw_items = self._news.search_news(query)
+            self._append_trace(trace, "news_layer_ok", "ok", "news.layer")
+        except NewsClientError as exc:
+            self._append_trace(
+                trace,
+                "news_layer_failed",
+                "fallback",
+                "news.layer",
+                detail=f"{exc.category}: {exc.message}",
+            )
+            return f"Не удалось получить новости без браузера: {exc.message}"
+
+        result.news = self._normalize_news(raw_items)
+        result.sources = self._merge_sources([item.url for item in result.news if item.url.strip()], result.sources)
+        return None
 
     def _open_site_for_query(
         self,
@@ -2488,19 +2520,6 @@ class TaskStore:
             self._append_trace(trace, "rule_plan_general", "ok", "rule.plan")
         return plan
 
-    def _should_prefer_llm_only_informational_answer(self, plan: dict[str, Any], query: str) -> bool:
-        if not (self._llm is not None and self._llm.enabled()):
-            return False
-        if plan.get("request_route") != "informational_request":
-            return False
-        if not plan.get("wants_news"):
-            return False
-        if plan.get("wants_message") or plan.get("supports_browser_action"):
-            return False
-        if is_open_site_request_clean(query):
-            return False
-        return True
-
     def create_task(self, req: TaskCreateRequest, conversation_id: str | None = None) -> TaskResponse:
         task_id = str(uuid4())
         trace_id = str(uuid4())
@@ -2556,24 +2575,13 @@ class TaskStore:
                 self._tasks[task_id] = task
             return task
 
-        if self._should_prefer_llm_only_informational_answer(plan, req.query):
-            self._append_trace(trace, "informational_llm_only", "ok", "llm.answer")
-            status = "done"
-            task = TaskResponse(
-                task_id=task_id,
-                trace_id=trace_id,
-                status=status,
-                conversation_id=conversation_id,
-                session_id=session_id,
-                result=result,
-                trace=trace,
-                error=None,
-            )
-            with self._lock:
-                self._tasks[task_id] = task
-            return task
+        if plan["wants_news"]:
+            news_error = self._run_non_browser_news_retrieval(req.query, trace, result)
+            if news_error is not None:
+                task_error = news_error
 
-        if has_search_work:
+        informational_needs_browser = plan["wants_product"] or (plan["wants_news"] and not result.news)
+        if informational_needs_browser:
             session_id, informational_error = self._run_informational_retrieval(
                 query=req.query,
                 trace=trace,
@@ -2584,6 +2592,8 @@ class TaskStore:
             )
             if informational_error is not None:
                 task_error = informational_error
+            elif result.news or self._has_product_data(result.product):
+                task_error = None
 
         if req.allow_social_actions and supports_browser_action and plan["wants_message"]:
             status, session_id, task_error = self._prepare_message_action(
@@ -2717,24 +2727,13 @@ class TaskStore:
                 self._tasks[task_id] = task
             return task
 
-        if self._should_prefer_llm_only_informational_answer(plan, req.query):
-            self._append_trace(trace, "informational_llm_only", "ok", "llm.answer")
-            assistant_text = self._answer_general_query(req.query, trace)
-            task.status = "done"
-            task.result = result
-            task.error = None
-            task.trace = trace
-            if conversation_id is not None:
-                self._set_assistant_message_for_task(
-                    conversation_id,
-                    task.task_id,
-                    assistant_text,
-                )
-            with self._lock:
-                self._tasks[task_id] = task
-            return task
+        if plan["wants_news"]:
+            news_error = self._run_non_browser_news_retrieval(req.query, trace, result)
+            if news_error is not None:
+                task_error = news_error
 
-        if has_search_work:
+        informational_needs_browser = plan["wants_product"] or (plan["wants_news"] and not result.news)
+        if informational_needs_browser:
             session_id, informational_error = self._run_informational_retrieval(
                 query=req.query,
                 trace=trace,
@@ -2745,6 +2744,8 @@ class TaskStore:
             )
             if informational_error is not None and task_error is None:
                 task_error = informational_error
+            elif informational_error is None and (result.news or self._has_product_data(result.product)):
+                task_error = None
 
         if req.allow_social_actions and supports_browser_action and plan["wants_message"]:
             status, session_id, task_error = self._prepare_message_action(

@@ -207,6 +207,29 @@ class FakeToolsClientInformationalNoOpen(FakeToolsClient):
         return super().call_tool(tool=tool, session_id=session_id, input_data=input_data, trace_id=trace_id)
 
 
+class FakeNewsClient:
+    def enabled(self) -> bool:
+        return True
+
+    def search_news(self, query: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "title": "Рынок электромобилей растет",
+                "summary": "Короткая сводка по рынку электромобилей.",
+                "published_at": "2026-04-05T08:00:00Z",
+                "url": "https://example.com/ev-news-1",
+                "source": "Example",
+            },
+            {
+                "title": "Apple обсуждает новые батареи",
+                "summary": "Короткая сводка по Apple.",
+                "published_at": "2026-04-04T09:00:00Z",
+                "url": "https://example.com/apple-news-1",
+                "source": "Example",
+            },
+        ]
+
+
 @pytest.fixture()
 def client() -> TestClient:
     store.reset_for_tests(tools_client=FakeToolsClient())
@@ -456,7 +479,11 @@ def test_message_only_request_skips_search_and_sources(client: TestClient) -> No
 
 
 def test_informational_news_flow_skips_browser_open_when_search_succeeds(client: TestClient) -> None:
-    store.reset_for_tests(tools_client=FakeToolsClientInformationalNoOpen(), llm_client=None)
+    store.reset_for_tests(
+        tools_client=FakeToolsClientInformationalNoOpen(),
+        llm_client=None,
+        news_client=FakeNewsClient(),
+    )
 
     resp = client.post(
         "/task",
@@ -468,12 +495,17 @@ def test_informational_news_flow_skips_browser_open_when_search_succeeds(client:
     assert data["status"] == "done"
     assert data["error"] is None
     assert data["result"]["news"]
-    assert [item for item in data["trace"] if item["step"] == "informational_flow"]
+    assert [item for item in data["trace"] if item["step"] == "news_layer_ok"]
     assert [item for item in data["trace"] if "browser.open" in item["step"]] == []
+    assert [item for item in data["trace"] if "browser.search" in item["step"]] == []
 
 
-def test_news_prompt_uses_llm_only_without_browser_actions_in_chat(client: TestClient) -> None:
-    store.reset_for_tests(tools_client=FakeToolsClientInformationalNoOpen(), llm_client=FakeLLMClientGeneralAnswer())
+def test_news_prompt_uses_non_browser_news_layer_with_links_in_chat(client: TestClient) -> None:
+    store.reset_for_tests(
+        tools_client=FakeToolsClientInformationalNoOpen(),
+        llm_client=FakeLLMClientOk(),
+        news_client=FakeNewsClient(),
+    )
 
     conv = client.post("/chat/conversations", json={"title": "News"}).json()
     cid = conv["conversation_id"]
@@ -487,10 +519,12 @@ def test_news_prompt_uses_llm_only_without_browser_actions_in_chat(client: TestC
     task = wait_for_task(client, created.json()["task"]["task_id"])
     assert task["status"] == "done"
     assert task["error"] is None
-    assert [item for item in task["trace"] if item["step"] == "informational_llm_only"]
+    assert [item for item in task["trace"] if item["step"] == "news_layer_ok"]
     assert [item for item in task["trace"] if "browser.open" in item["step"]] == []
     assert [item for item in task["trace"] if "browser.search" in item["step"]] == []
 
     messages = client.get(f"/chat/conversations/{cid}/messages").json()["items"]
     assistant_message = [m for m in messages if m["role"] == "assistant" and m["task_id"] == task["task_id"]][0]["content"]
-    assert "профицит калорий" in assistant_message.lower()
+    assert "stub summary" in assistant_message
+    assert "Ссылки:" in assistant_message
+    assert "https://example.com/ev-news-1" in assistant_message
